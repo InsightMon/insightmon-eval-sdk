@@ -276,8 +276,9 @@ exporters:
 - 日志处理器只转发评估结果事件，不转发消息内容事件；
 - `record_io()` 什么也不做，返回 `False`。
 
-**列表之外的属性照常发送**，平台在 `metadata_only` 模式下也会保存这些非标准属性。请检查你用的插桩写了哪些带内容的
-属性，表里没有的用 `content_attributes` 补上（属性名，或以 `*` 结尾的前缀）：
+**列表之外的属性照常发送**：平台的 `metadata_only` 模式只丢弃标准内容属性和这份第三方清单，不认识的属性照样保存
+（旧版平台连清单里的第三方属性也保存）。请检查你用的插桩写了哪些带内容的属性，表里没有的用 `content_attributes`
+补上（属性名，或以 `*` 结尾的前缀）：
 
 ```python
 import insightmon
@@ -317,7 +318,8 @@ with insightmon.thread("chat-45"), insightmon.turn():
 - 插桩以**日志事件**发出的内容（`gen_ai.user.message` 等）只有经过 SDK 的日志处理器才会转发：把插桩所用的
   `LoggerProvider` 传给 `init(logger_provider=...)`。SDK 自己新建的 `LoggerProvider` 只供 `log_evaluation()` 使用，
   插桩不会用到它。
-- 平台侧还有一道开关：项目设置的内容采集模式为 `metadata_only` 时，平台不保存标准的消息内容。平台按入库规则做脱敏。
+- 平台侧还有一道开关：项目设置的内容采集模式为 `metadata_only` 时，平台不保存标准的消息内容和清单中的第三方内容
+  属性。平台按入库规则做脱敏（第三方内容属性也在其中）。
 
 ## 评估日志
 
@@ -336,7 +338,9 @@ insightmon.log_evaluation("mentions_city", label="pass", span=span)
 
 - **名称必须是项目里已发布的评分定义**（侧栏「评分定义」）。平台把名称转小写、非 `[a-z0-9_]` 字符换成 `_`。
   未知名称会被平台拒绝：SDK 读取 OTLP 的 partial success 响应，对每种原因记一条 warning（例如
-  `score_config_not_found`），并计入 `insightmon.rejections()`。
+  `score_config_not_found`），并计入 `insightmon.rejections()`。导出到平台时，SDK 还在后台读取一次项目已发布的
+  评分定义（`GET /api/v1/score-configs`，每次 `init()` 一次，不阻塞调用），对项目里没有的名称各记一条 warning；
+  平台没有这个接口或 Key 无权读取时不检查。记录照常发送。
 - `value`、`label`、`error_type` 三者给且只给一个；`error_type` 表示评估器本身失败（写成 unscored 分数）。
 - 关联：给 `span=`（或在被评估的 span 里调用）；拿不到 span 时给 `response_id=`（先用 `set_response_id()` 写在 span 上）。
 - 分数落在哪一层：评分定义允许 span 级时落在该 span，否则落在它的 trace，再否则落在会话。
@@ -422,20 +426,26 @@ print(result.status, result.pass_rate, result.url)
   `trials=` 每个样例跑 1–10 次。
 - **客户端评估器**只作诊断，不影响结论。它们在条目的轮次结束后、在条目的 trace 之外运行：评估器自己产生的 span
   （例如插桩记录的模型调用）被丢弃，不会混进平台评估器读取的 agent 轨迹，也不会成为生产 trace。它们的**名称必须是
-  已发布的评分定义**、值必须符合定义，否则平台拒绝这些分数，SDK 不带这些分数重新上报该条目并记 warning（同一组
-  名称被拒 3 次、且平台从未接受过这组名称时，本次运行的其余条目直接不带它们）；`trials` > 1 时，一个 trial 的无效
-  分数不会连累其他 trial 的分数。分数 metadata 中平台保留的键（`adjudicated`、`accepted_by` 等）被去掉并记 warning。
+  已发布的、允许实验条目层级的评分定义**：有客户端评估器时，SDK 每次运行读取一次已发布的评分定义
+  （`GET /api/v1/score-configs`），不在其中的名称直接不上报，每个名称记一条 warning（平台没有这个接口或 Key 无权读取时
+  跳过这一步）。值必须符合定义，否则平台拒绝这些分数并列出每一个，SDK 只去掉被列出的分数、重新上报一次并记
+  warning（旧版平台只指出第一个条目：SDK 去掉该条目的全部客户端分数；同一个名称被拒 3 次、且平台从未接受过它时，
+  本次运行的其余条目直接不带它）；`trials` > 1 时，一个 trial 的无效分数不会连累其他 trial 的分数。分数 metadata 中
+  平台保留的键（`adjudicated`、`accepted_by` 等）被去掉并记 warning。
 - **服务端评估器**是平台上发布的评估器版本 id（gating），也可以写 `{"evaluator_version_id": ..., "role": "diagnostic"}`。
 - **超时与并发**：`timeout_s` 到时，这次运行记为 `timeout`；但线程无法被杀死，任务返回之前仍占着 `max_concurrency`
   中的一个名额，所以挂起的下游服务同时最多只会收到 `max_concurrency` 个调用。所有名额都被超时仍未返回的任务占着、
   再过 `timeout_s` 仍没有空出时，运行停止（不 finalize），抛出写明实验 id 的 `RuntimeError`。
 - 每次运行都有自己的 trace（根 span `evaluate`），任务里创建的 span 都在其中；SDK 等条目上报后才导出这些 span，
-  平台把它们并入实验 trace（`origin = experiment`），不会出现在生产会话里。经 Collector 转发时要用
-  `init(export_processor=...)`（见[接入已有的 OpenTelemetry](#接入已有的-opentelemetry)），否则 span 无法暂存，
-  `evaluate()` 记一条 warning。
+  平台把它们并入实验 trace（`origin = experiment`），不会出现在生产会话里。平台也认得根 span 上的
+  `insightmon.experiment_id`，但只对同一个 Key 创建的实验、且只在带这个属性的根 span 到达之后生效（根 span 最后
+  结束），所以 SDK 仍然暂存。经 Collector 转发时要用 `init(export_processor=...)`（见
+  [接入已有的 OpenTelemetry](#接入已有的-opentelemetry)），否则 span 无法暂存，`evaluate()` 记一条 warning。
 - **上报重试**：`items:batch` 与 `:finalize` 是幂等的，SDK 对 429、5xx 和网络错误最多重试 8 次（退避合计约 40 秒，
-  `Retry-After` 另计；`Client(report_retries=...)` 可调），平台短暂不可用不会让运行停下。创建实验没有幂等键，
-  只在确定请求没有送达时重试；网关答 502 / 504、读超时等情况下实验可能已经建好，错误消息会提示先到实验页面确认。
+  `Retry-After` 另计；`Client(report_retries=...)` 可调），平台短暂不可用不会让运行停下。创建实验带着每次运行生成的
+  幂等键，读超时、5xx 和网络错误同样重试：平台对同一个键和同样的内容返回已经建好的实验，不会建出第二个。旧版平台
+  不认幂等键（答 422、什么也没建），SDK 改为不带键创建，只在确定请求没有送达时重试；那时网关答 502 / 504、读超时
+  等情况下实验可能已经建好，错误消息会提示先到实验页面确认。
 - `result.url` 是平台上的实验页面；`result.items` 是本地记录的每次运行（状态、输出、延迟、trace id、客户端分数）；
   `wait=False` 时不等平台评估完成。
 - 异步版本 `aevaluate()`：异步任务直接 await（`timeout_s` 到时取消）；同步任务、同步评估器和 SDK 的 REST 调用在
@@ -535,9 +545,9 @@ app = insightmon.InsightMonASGIMiddleware(app, flush_when=is_replay, flush_timeo
 `flush_when` 收到 ASGI 的 scope（WSGI 中间件收到 environ），只对带 `traceparent` 的请求调用。WSGI 中间件在服务器
 拿到最后一块响应之前导出：应用返回列表时立即导出，流式响应则提前读一块（响应因此晚一块发出）。
 
-**平台使用 SQLite 时不要在响应前导出**：平台在等待响应期间持有数据库写锁，导出会一直阻塞到超时，条目记为
-`timeout`、span 丢失。SQLite 上不要开 `flush_on_traceparent` / `flush_when`，并把 `receipt_wait_s` 设为至少几秒；
-PostgreSQL 上两种方式都可以。
+**旧版平台使用 SQLite 时不要在响应前导出**：迁移 0009 之前的平台在等待响应期间持有数据库写锁，导出会一直阻塞到
+超时，条目记为 `timeout`、span 丢失。在这样的平台上不要开 `flush_on_traceparent` / `flush_when`，并把
+`receipt_wait_s` 设为至少几秒。当前平台在调用服务之前提交事务，SQLite 与 PostgreSQL 上两种方式都可以。
 
 ## 配置
 
@@ -599,17 +609,21 @@ span。`init()` 返回的句柄也可以用作上下文管理器。
 - **会话没关闭**：最后一轮没有 `end_thread`；平台会按空闲时间关闭。
 - **warning `the platform refused N log records: score_config_not_found`**：评估名称没有对应的已发布评分定义；
   `insightmon.rejections()` 有累计数。
-- **`evaluate()` 的客户端分数不见了**：同上，名称必须是已发布的评分定义；warning 里有被拒的名称。
+- **warning `evaluation name '...' is not a published score config`**：`log_evaluation()` 的名称在项目里没有已发布的
+  评分定义（或该定义不允许 span、trace、会话层级），平台会拒绝这些记录。
+- **`evaluate()` 的客户端分数不见了**：同上，名称必须是已发布、允许实验条目层级的评分定义；warning
+  （`the client score '...' is not a published score config` 或 `the platform refused the client score`）里有名称。
 - **`evaluate()` 被中断后实验一直未完成**：见[中断](#中断ctrl-c--取消)，用 `Client().finalize_experiment(id)` 收尾。
 - **`evaluate()` 抛出 `RuntimeError`，说超时的任务仍在运行**：下游服务挂住了，`max_concurrency` 的名额全被超时未返回
   的任务占着。查明挂起的原因，或者调大 `timeout_s`；实验没有 finalize，处理同上。
 - **warning `the spans of evaluate() are exported as they end, not held`**：span 由你自己加到 provider 上的处理器导出，
   SDK 无法暂存；改用 `init(export_processor=...)`（见[接入已有的 OpenTelemetry](#接入已有的-opentelemetry)）。
 - **创建实验报错，提示 `the experiment may have been created`**：请求已经到达服务器（网关答 502 / 504、读超时等），
-  先到平台的实验页面确认，再决定是否重新运行。
+  重试也没有拿到答复。错误的 `params` 带着发送过的 `idempotency_key` 时，用同一个键和同样的参数调用
+  `Client().create_experiment(...)` 会拿到已经建好的实验；否则（旧版平台）先到平台的实验页面确认，再决定是否重新运行。
 - **开启 `capture_content` 后看不到插桩以日志事件发出的内容**：把插桩所用的 `LoggerProvider` 传给
   `init(logger_provider=...)`，见[内容采集与隐私](#内容采集与隐私)。
-- **回放条目全部 `timeout`、回执 `none`**：平台用 SQLite 且服务开了 `flush_on_traceparent`，见[回放回执](#回放回执)。
+- **回放条目全部 `timeout`、回执 `none`**：旧版平台用 SQLite 且服务开了 `flush_on_traceparent`，见[回放回执](#回放回执)。
 - **回执 `version_source = none`**：span 没在 `receipt_wait_s` 内到达，或服务没接上 `traceparent`（没加中间件，
   或在线程池里丢了上下文）。
 - **代理**：OTLP 导出与 REST 请求都遵循 `HTTPS_PROXY` / `NO_PROXY`。
@@ -621,7 +635,10 @@ span。`init()` 返回的句柄也可以用作上下文管理器。
   已在 1.35 到 1.45 上测试；httpx ≥ 0.27。
 - 平台：对接 [InsightMon/insightmon-ai-eval](https://github.com/InsightMon/insightmon-ai-eval) 当前 `main` 的
   OTLP/HTTP 端点（`/otlp/v1/traces`、`/otlp/v1/logs`）和 Key 接口（`/api/v1`），契约见
-  [docs/contract.md](docs/contract.md)。平台用 SQLite 时注意[回放回执](#回放回执)中的限制。
+  [docs/contract.md](docs/contract.md)。实验幂等键、`GET /api/v1/score-configs`、`items:batch` 列出全部无效分数、
+  按 `insightmon.experiment_id` 识别实验 trace、回放时先提交事务再调用服务，这些平台改动随数据库迁移 0009 一起
+  发布；对更早的平台，SDK 自动退回原来的做法（见 contract.md 开头的说明），平台用 SQLite 时注意
+  [回放回执](#回放回执)中的限制。
 - Web 框架：ASGI / WSGI 中间件不依赖任何框架。
 
 ## 开发

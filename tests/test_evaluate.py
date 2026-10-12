@@ -698,6 +698,84 @@ def test_an_out_of_range_score_of_one_trial_keeps_the_other_trials_scores(
     assert {ref: r.get("scores", []) for ref, r in platform.reports.items()} == scores
 
 
+def short(input: Any, output: Any, reference: Any) -> dict[str, Any]:
+    return {"name": "short", "value": len(output["text"]) < 40}
+
+
+def test_unpublished_client_score_names_are_dropped_before_reporting(
+    client: Client, mock_api: MockApi, caplog: pytest.LogCaptureFixture
+) -> None:
+    platform = FakePlatform(keys(3), score_names=frozenset({"short"}), lists_configs=True)
+    platform.install(mock_api)
+    result = insightmon.evaluate(
+        answer, dataset="ds", trials=2, evaluators=[mentions_city, short], client=client
+    )
+    assert result.status == "completed"
+    assert platform.events == ["create", "score-configs", "batch:6", "finalize"]  # no refusal
+    assert all(i.scores == [{"name": "short", "value": True}] for i in result.items)
+    assert all(r["scores"] == [{"name": "short", "value": True}] for r in platform.reports.values())
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1  # once per name and run
+    assert "'mentions_city' is not a published score config" in warnings[0]
+
+
+def test_score_configs_are_read_only_with_client_evaluators(
+    client: Client, mock_api: MockApi
+) -> None:
+    platform = FakePlatform(keys(2), lists_configs=True).install(mock_api)
+    insightmon.evaluate(answer, dataset="ds", client=client)
+    assert "score-configs" not in platform.events
+
+
+async def test_aevaluate_drops_unpublished_client_score_names(
+    client: Client, mock_api: MockApi
+) -> None:
+    platform = FakePlatform(keys(2), score_names=frozenset({"short"}), lists_configs=True)
+    platform.install(mock_api)
+    result = await insightmon.aevaluate(
+        answer, dataset="ds", evaluators=[mentions_city, short], client=client
+    )
+    assert platform.events.count("score-configs") == 1
+    assert [e for e in platform.events if e.startswith("batch")] == ["batch:2"]
+    assert all(i.scores == [{"name": "short", "value": True}] for i in result.items)
+
+
+def test_each_run_creates_with_an_idempotency_key_of_its_own(
+    client: Client, mock_api: MockApi
+) -> None:
+    platform = FakePlatform(keys(1)).install(mock_api)
+    insightmon.evaluate(answer, dataset="ds", client=client)
+    first = platform.create_body
+    platform.finalized = False  # the fake serves one experiment: start it over
+    platform.reports.clear()
+    insightmon.evaluate(answer, dataset="ds", client=client)
+    second = platform.create_body
+    assert first is not None
+    assert second is not None
+    assert len(first["idempotency_key"]) == 32
+    assert first["idempotency_key"] != second["idempotency_key"]
+
+
+def test_a_create_whose_answer_was_lost_is_retried_with_the_same_key(
+    client: Client, mock_api: MockApi
+) -> None:
+    platform = FakePlatform(keys(2)).install(mock_api)
+    keys_sent: list[str] = []
+
+    def create(request: httpx.Request) -> httpx.Response:
+        keys_sent.append(json.loads(request.content)["idempotency_key"])
+        answer = platform.create(request)
+        if len(keys_sent) == 1:
+            raise httpx.ReadTimeout("the answer got lost")
+        return answer
+
+    mock_api.routes[("POST", EXP)] = [create]
+    result = insightmon.evaluate(answer, dataset="ds", client=client)
+    assert result.status == "completed"
+    assert len(keys_sent) == 2
+    assert keys_sent[0] == keys_sent[1]
+
+
 # --------------------------------------------------------------------------- finalize, wait
 
 

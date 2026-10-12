@@ -7,8 +7,9 @@ versions from it (`version_source = trace_attr`). With `--receipt-field` the res
 the same receipt as well (`version_source = both`, no conflicts).
 
 The Target waits `receipt_wait_s = 5` and the agent exports in the background (batch delay
-200 ms): on a platform backed by SQLite, exporting before the response
-(`flush_on_traceparent`) blocks until the call times out (see README, "Replay receipts").
+200 ms), which works on every platform: on an older platform backed by SQLite, exporting
+before the response (`flush_on_traceparent`) blocks until the call times out (see README,
+"Replay receipts"); the current platform commits before it calls the agent.
 """
 
 from __future__ import annotations

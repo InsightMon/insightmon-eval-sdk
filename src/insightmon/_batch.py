@@ -9,19 +9,23 @@ platform deduplicates by report content). After each successful request `on_repo
 called with the reported items (evaluate releases their held spans there).
 
 400 `external_item_invalid {reason: "score_invalid"}` (a client score whose name is not a
-published score config, or whose value does not fit it): nothing of the request was written,
-so the batcher drops the refused item's client scores and sends the request again. The
-platform names the item by `example_key` (and `trial_index` when it says so). When several
-items of that example carry client scores (trials), the batcher does not guess: it sends one
-of them with the rest of the request and the others alone, so that each refusal names exactly
-one item and valid scores are never dropped for another trial's value.
+published score config with the `experiment_item` level, is sent twice, or whose value does
+not fit it): nothing of the request was written, so the batcher drops the refused client
+scores and sends the request again. A platform that lists every offending score of the
+request in `invalid_scores` (`[{example_key, trial_index, name}]`) gets one more request with
+exactly those scores dropped. An older one names only the first item, by `example_key` (and
+`trial_index` when it says so): the batcher then drops all client scores of that item, and
+when several items of that example carry client scores (trials) it does not guess: it sends
+one of them with the rest of the request and the others alone, so that each refusal names
+exactly one item and valid scores are never dropped for another trial's value.
 
 Bounds: after `REFUSALS_PER_REQUEST` refusals within one request, the items that still carry
 client scores are sent one at a time (a refusal then re-sends one small item, never the whole
-request again). After `REFUSALS_BEFORE_DROP` refusals of items carrying the same set of score
-names, a set the platform never accepted is dropped from every other item of the run up front
-(a misnamed evaluator would otherwise cost one extra request per item). One warning per set
-of names, one more when the set is dropped for the rest of the run.
+request again). After `REFUSALS_BEFORE_DROP` refusals of the same score name (of the same set
+of names, when the platform does not list names), a name the platform never accepted is
+dropped from every other item of the run up front (a misnamed evaluator would otherwise cost
+one extra request per batch). One warning per name (set of names), one more when it is
+dropped for the rest of the run.
 
 Thread-safe: `add()` is called from evaluate's worker threads; requests are sent one at a
 time. A failed request is kept as the first error; later `add()` / `flush()` calls raise it
@@ -33,7 +37,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from types import TracebackType
 from typing import TYPE_CHECKING, Any
 
@@ -50,9 +54,10 @@ log = logging.getLogger("insightmon")
 
 ReportedCallback = Callable[[Sequence[Mapping[str, Any]]], None]
 
-#: Refusals of items carrying the same set of client score names after which the batcher drops
-#: that set from the remaining items of the run without asking the platform again (unless the
-#: platform accepted that set before: its refusals are then about values, not names).
+#: Refusals of the same client score name (of items carrying the same set of names, when the
+#: platform does not list names) after which the batcher drops it from the remaining items of
+#: the run without asking the platform again (unless the platform accepted it before: its
+#: refusals are then about values, not names).
 REFUSALS_BEFORE_DROP = 3
 #: `score_invalid` refusals within one request after which the items that still carry client
 #: scores are sent one at a time.
@@ -123,9 +128,10 @@ class ItemBatcher:
         self._error: Exception | None = None
         self._closed = False
         self._timer: threading.Thread | None = None
-        #: set of client score names -> refusals (`score_invalid`); only touched while sending
+        #: set of client score names (one name when the platform listed it) -> refusals
+        #: (`score_invalid`); only touched while sending
         self._refusals: dict[frozenset[str], int] = {}
-        #: sets of client score names the platform accepted at least once
+        #: sets of client score names (and each name alone) the platform accepted at least once
         self._accepted_names: set[frozenset[str]] = set()
 
     # ------------------------------------------------------------------ public
@@ -292,20 +298,33 @@ class ItemBatcher:
         )
 
     def _without_dropped_scores(self, item: Mapping[str, Any]) -> Mapping[str, Any]:
-        if item.get("scores") and self._dropped(_score_names(item)):
-            return _without_scores(item)
-        return item
-
-    def _refused(self, item: Mapping[str, Any]) -> None:
+        if not item.get("scores"):
+            return item
         names = _score_names(item)
+        if self._dropped(names):
+            return _without_scores(item)
+        dropped = {name for name in names if self._dropped(frozenset({name}))}
+        return _without_names(item, dropped) if dropped else item
+
+    def _refused(self, item: Mapping[str, Any], listed: Sequence[str] | None = None) -> None:
+        """Count a refusal of the item's client scores: of each of `listed` (the names the
+        platform listed in `invalid_scores`), or of the item's whole set of names."""
+        if listed is not None:
+            for name in listed:
+                self._count_refusal(item, frozenset({name}), "the client score")
+            return
+        self._count_refusal(item, _score_names(item), "the client scores")
+
+    def _count_refusal(self, item: Mapping[str, Any], names: frozenset[str], what: str) -> None:
         count = self._refusals.get(names, 0) + 1
         self._refusals[names] = count
         level = logging.WARNING if count == 1 else logging.DEBUG
         log.log(
             level,
-            "insightmon: the platform refused the client scores %s of example %r trial %s "
-            "(each name must be a published score config of the project and each value must "
-            "fit it); reporting the item without client scores",
+            "insightmon: the platform refused %s %s of example %r trial %s (each name must be "
+            "a published score config of the project for experiment items and each value must "
+            "fit it); reporting the item without it",
+            what,
             sorted(names),
             item.get("example_key"),
             item.get("trial_index"),
@@ -334,15 +353,21 @@ class ItemBatcher:
                     self.experiment_id, items, max_body_bytes=self.max_body_bytes
                 )
             except InsightMonError as err:
-                refused = _score_invalid_items(err, indexes, state.items)
-                if not refused:
-                    raise
-                if len(refused) > 1:  # several trials of that example carry client scores
-                    self._send_apart(state, indexes, refused[1:])
-                    return
-                index = refused[0]
-                self._refused(state.items[index])
-                state.items[index] = _without_scores(state.items[index])
+                listed = _listed_invalid_scores(err, indexes, state.items)
+                if listed:  # drop exactly the scores the platform listed, then send once more
+                    for index, names in listed.items():
+                        self._refused(state.items[index], names)
+                        state.items[index] = _without_names(state.items[index], names)
+                else:
+                    refused = _score_invalid_items(err, indexes, state.items)
+                    if not refused:
+                        raise
+                    if len(refused) > 1:  # several trials of that example carry client scores
+                        self._send_apart(state, indexes, refused[1:])
+                        return
+                    index = refused[0]
+                    self._refused(state.items[index])
+                    state.items[index] = _without_scores(state.items[index])
                 state.refusals += 1
                 for i in indexes:
                     state.items[i] = self._without_dropped_scores(state.items[i])
@@ -362,7 +387,9 @@ class ItemBatcher:
         state.confirmed.update(indexes)
         for item in items:
             if item.get("scores"):
-                self._accepted_names.add(_score_names(item))
+                names = _score_names(item)
+                self._accepted_names.add(names)
+                self._accepted_names.update(frozenset({name}) for name in names)
         with self._lock:
             self.accepted += result.accepted
             self.duplicates += result.duplicates
@@ -382,6 +409,47 @@ def _score_names(item: Mapping[str, Any]) -> frozenset[str]:
 
 def _without_scores(item: Mapping[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in item.items() if k != "scores"}
+
+
+def _without_names(item: Mapping[str, Any], names: Collection[str]) -> dict[str, Any]:
+    """The item without its client scores named in `names` (without `scores` when none is
+    left)."""
+    kept = [
+        score
+        for score in item.get("scores") or ()
+        if not (isinstance(score, Mapping) and str(score.get("name")) in names)
+    ]
+    out = _without_scores(item)
+    if kept:
+        out["scores"] = kept
+    return out
+
+
+def _listed_invalid_scores(
+    error: InsightMonError, indexes: Sequence[int], items: Sequence[Mapping[str, Any]]
+) -> dict[int, list[str]]:
+    """Item index (among `indexes`) -> the names of its client scores that a 400
+    `external_item_invalid {reason: score_invalid}` lists in `invalid_scores`. Empty for any
+    other error, for a platform that does not list them, or when no listed score is among the
+    items' client scores (the caller then falls back to `_score_invalid_items`)."""
+    if error.code != EXTERNAL_ITEM_INVALID or error.params.get("reason") != "score_invalid":
+        return {}
+    listed = error.params.get("invalid_scores")
+    if not isinstance(listed, list):
+        return {}
+    wanted: dict[tuple[Any, Any], set[str]] = {}
+    for entry in listed:
+        if isinstance(entry, Mapping) and isinstance(entry.get("name"), str):
+            ref = (entry.get("example_key"), entry.get("trial_index"))
+            wanted.setdefault(ref, set()).add(entry["name"])
+    out: dict[int, list[str]] = {}
+    for i in indexes:
+        names = wanted.get((items[i].get("example_key"), items[i].get("trial_index")))
+        if names:
+            present = sorted(names & _score_names(items[i]))
+            if present:
+                out[i] = present
+    return out
 
 
 def _score_invalid_items(

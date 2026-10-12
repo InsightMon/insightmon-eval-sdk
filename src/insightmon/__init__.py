@@ -21,7 +21,7 @@ from insightmon._errors import InsightMonError
 from insightmon._export import Rejections, rejections
 from insightmon._setup import InsightMonHandle, flush, init, shutdown
 from insightmon._version import __version__
-from insightmon.client import ApiKeyInfo, Client, Example, ExamplesPage, ReportResult
+from insightmon.client import ApiKeyInfo, Client, Example, ExamplesPage, ReportResult, ScoreConfig
 from insightmon.content import record_io
 from insightmon.evaluate import ExperimentResult, ItemResult, aevaluate, evaluate
 from insightmon.logs import log_evaluation
@@ -58,6 +58,7 @@ __all__ = [
     "ItemResult",
     "Rejections",
     "ReportResult",
+    "ScoreConfig",
     "Settings",
     "ThreadScope",
     "__version__",

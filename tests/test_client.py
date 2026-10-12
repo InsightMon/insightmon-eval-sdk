@@ -17,10 +17,12 @@ from insightmon.client import (
     ApiKeyInfo,
     Client,
     Example,
+    ScoreConfig,
     component_refs,
     normalize_evaluators,
     normalize_requested,
     plan_requests,
+    published_score_names,
 )
 from tests.conftest import API_KEY, BASE_URL, MockApi, error_response
 
@@ -289,7 +291,83 @@ def test_scores_batch_platform_error(client: Client, mock_api: MockApi) -> None:
     assert len(mock_api.requests) == 1
 
 
+# --------------------------------------------------------------------------- score configs
+
+SCORE_CONFIGS = "/api/v1/score-configs"
+CONFIGS = {
+    "items": [
+        {
+            "name": "helpful",
+            "data_type": "categorical",
+            "labels": ["yes", "no"],
+            "min": None,
+            "max": None,
+            "subject_levels": ["span", "trace"],
+            "allow_unknown": True,
+        },
+        {
+            "name": "quality",
+            "data_type": "numeric",
+            "labels": None,
+            "min": 0,
+            "max": 1,
+            "subject_levels": ["experiment_item"],
+            "allow_unknown": False,
+        },
+    ]
+}
+
+
+def test_score_configs(client: Client, mock_api: MockApi) -> None:
+    mock_api.add("GET", SCORE_CONFIGS, CONFIGS)
+    assert client.score_configs() == [
+        ScoreConfig("helpful", "categorical", ("yes", "no"), None, None, ("span", "trace"), True),
+        ScoreConfig("quality", "numeric", None, 0.0, 1.0, ("experiment_item",), False),
+    ]
+    assert published_score_names(client, ["experiment_item"]) == {"quality"}
+    assert published_score_names(client, ["span", "thread"]) == {"helpful"}
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        error_response(404, "not_found", {"resource": "route"}),  # a platform without the route
+        error_response(403, "permission_denied"),  # a key without its scopes
+        httpx.Response(200, json={"configs": []}),
+        httpx.Response(200, json={"items": [{"name": "x"}]}),
+    ],
+)
+def test_published_score_names_unknown(
+    client: Client, mock_api: MockApi, answer: httpx.Response
+) -> None:
+    mock_api.add("GET", SCORE_CONFIGS, answer)
+    assert published_score_names(client, ["experiment_item"]) is None
+    assert len(mock_api.requests) == 1  # never retried
+
+
 # --------------------------------------------------------------------------- experiments
+
+
+def key_refused() -> httpx.Response:
+    """What a platform that predates `idempotency_key` answers a keyed create (422, nothing
+    created)."""
+    return error_response(
+        422,
+        "validation_error",
+        {
+            "errors": [
+                {
+                    "loc": ["body", "idempotency_key"],
+                    "type": "extra_forbidden",
+                    "msg": "Extra inputs are not permitted",
+                }
+            ]
+        },
+    )
+
+
+def created() -> httpx.Response:
+    return httpx.Response(201, json={"experiment": EXPERIMENT})
 
 
 def test_create_experiment_body(client: Client, mock_api: MockApi) -> None:
@@ -315,6 +393,9 @@ def test_create_experiment_body(client: Client, mock_api: MockApi) -> None:
     )
     assert experiment == EXPERIMENT
     (body,) = mock_api.json_bodies("POST", EXP)
+    key = body.pop("idempotency_key")
+    assert isinstance(key, str)
+    assert len(key) == 32
     assert body == {
         "name": "nightly",
         "dataset_id": "ds-1",
@@ -338,11 +419,18 @@ def test_create_experiment_body(client: Client, mock_api: MockApi) -> None:
 
 
 def test_create_experiment_minimal_body(client: Client, mock_api: MockApi) -> None:
-    mock_api.add("POST", EXP, httpx.Response(201, json={"experiment": EXPERIMENT}))
+    mock_api.add("POST", EXP, created())
+    client.create_experiment(name="n", dataset_id="ds-1", idempotency_key="run-1")
     client.create_experiment(name="n", dataset_id="ds-1")
-    assert mock_api.json_bodies("POST", EXP) == [
-        {"name": "n", "dataset_id": "ds-1", "trials": 1, "triggered_by": "sdk"}
-    ]
+    first, second = mock_api.json_bodies("POST", EXP)
+    assert first == {
+        "name": "n",
+        "dataset_id": "ds-1",
+        "trials": 1,
+        "triggered_by": "sdk",
+        "idempotency_key": "run-1",
+    }
+    assert second["idempotency_key"] != "run-1"
 
 
 @pytest.mark.parametrize(
@@ -366,6 +454,8 @@ def test_create_experiment_minimal_body(client: Client, mock_api: MockApi) -> No
         {"requested": {"components": [{"type": "prompt", "name": "a"}] * 2}},
         {"triggered_by": "human"},
         {"metadata": [1]},
+        {"idempotency_key": ""},
+        {"idempotency_key": "x" * 129},
     ],
 )
 def test_create_experiment_validates_locally(
@@ -385,7 +475,7 @@ def test_create_experiment_retries_connect_error_and_rate_limit(
         EXP,
         httpx.ConnectError("refused"),
         error_response(429, "rate_limited", {"retry_after_s": 7}, headers={"Retry-After": "7"}),
-        httpx.Response(201, json={"experiment": EXPERIMENT}),
+        created(),
     )
     assert client.create_experiment(name="n", dataset_id="ds-1")["id"] == "exp-1"
     assert len(mock_api.requests) == 3
@@ -394,31 +484,100 @@ def test_create_experiment_retries_connect_error_and_rate_limit(
 
 @pytest.mark.parametrize(
     "answer",
-    [httpx.ReadTimeout("slow"), httpx.RemoteProtocolError("closed")],
+    [
+        httpx.ReadTimeout("slow"),
+        httpx.RemoteProtocolError("closed"),
+        error_response(503, "internal_error"),
+        error_response(500, "internal_error"),
+        httpx.Response(504, text="<html>Gateway Timeout</html>"),
+    ],
 )
-def test_create_experiment_does_not_retry_after_delivery(
-    client: Client, mock_api: MockApi, answer: Exception
+def test_create_experiment_with_a_key_retries_after_delivery(
+    client: Client, mock_api: MockApi, answer: Any
 ) -> None:
-    mock_api.add("POST", EXP, answer, httpx.Response(201, json={"experiment": EXPERIMENT}))
+    # the platform answers the same key and content with the experiment it created
+    mock_api.add("POST", EXP, answer, created())
+    assert client.create_experiment(name="n", dataset_id="ds-1")["id"] == "exp-1"
+    first, second = mock_api.calls("POST", EXP)
+    assert first.content == second.content  # same key, same bytes
+    assert b'"idempotency_key"' in first.content
+
+
+def test_create_experiment_with_a_key_that_may_exist_names_the_key(
+    client: Client, mock_api: MockApi
+) -> None:
+    mock_api.add("POST", EXP, httpx.ReadTimeout("slow"))
+    with pytest.raises(InsightMonError) as info:
+        client.create_experiment(name="n", dataset_id="ds-1", idempotency_key="run-1")
+    assert len(mock_api.requests) == 4  # the retry budget
+    assert "may have been created" in info.value.message
+    assert "idempotency_key='run-1'" in info.value.message
+    assert info.value.params["idempotency_key"] == "run-1"
+
+
+@pytest.mark.parametrize(
+    ("status", "code"),
+    [
+        (409, "idempotency_key_conflict"),
+        (429, "judge_budget_exhausted"),
+        (422, "validation_error"),
+    ],
+)
+def test_create_experiment_with_a_key_does_not_retry_refusals(
+    client: Client, mock_api: MockApi, status: int, code: str
+) -> None:
+    # a 422 about another field is not the key refusal of an older platform
+    params = {"errors": [{"loc": ["body", "name"], "type": "string_too_long", "msg": "x"}]}
+    mock_api.add("POST", EXP, error_response(status, code, params))
     with pytest.raises(InsightMonError) as info:
         client.create_experiment(name="n", dataset_id="ds-1")
+    assert (info.value.status, info.value.code) == (status, code)
     assert len(mock_api.requests) == 1
+
+
+def test_create_experiment_without_key_support_sends_none(
+    client: Client, mock_api: MockApi, caplog: pytest.LogCaptureFixture
+) -> None:
+    mock_api.add("POST", EXP, key_refused(), created())
+    with caplog.at_level(logging.INFO, logger="insightmon"):
+        assert client.create_experiment(name="n", dataset_id="ds-1")["id"] == "exp-1"
+    first, second = mock_api.json_bodies("POST", EXP)
+    assert "idempotency_key" in first
+    assert second == {"name": "n", "dataset_id": "ds-1", "trials": 1, "triggered_by": "sdk"}
+    assert "does not take idempotency keys" in caplog.text
+    client.create_experiment(name="n", dataset_id="ds-1")  # remembered: no key sent again
+    assert len(mock_api.requests) == 3
+    assert "idempotency_key" not in mock_api.json_bodies("POST", EXP)[2]
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [httpx.ReadTimeout("slow"), httpx.RemoteProtocolError("closed")],
+)
+def test_create_experiment_without_key_support_does_not_retry_after_delivery(
+    client: Client, mock_api: MockApi, answer: Exception
+) -> None:
+    mock_api.add("POST", EXP, key_refused(), answer, created())
+    with pytest.raises(InsightMonError) as info:
+        client.create_experiment(name="n", dataset_id="ds-1")
+    assert len(mock_api.requests) == 2  # the refused keyed request, then one attempt
     assert info.value.delivered is None
     assert "may have been created" in info.value.message
+    assert "idempotency_key" not in info.value.params
 
 
 @pytest.mark.parametrize(
     ("status", "code"),
     [(503, "internal_error"), (500, "internal_error"), (429, "judge_budget_exhausted")],
 )
-def test_create_experiment_does_not_retry_server_errors(
+def test_create_experiment_without_key_support_does_not_retry_server_errors(
     client: Client, mock_api: MockApi, status: int, code: str
 ) -> None:
-    mock_api.add("POST", EXP, error_response(status, code))
+    mock_api.add("POST", EXP, key_refused(), error_response(status, code))
     with pytest.raises(InsightMonError) as info:
         client.create_experiment(name="n", dataset_id="ds-1")
     assert (info.value.status, info.value.code) == (status, code)
-    assert len(mock_api.requests) == 1
+    assert len(mock_api.requests) == 2
 
 
 @pytest.mark.parametrize(
@@ -430,13 +589,13 @@ def test_create_experiment_does_not_retry_server_errors(
         httpx.Response(500, text="upstream error"),
     ],
 )
-def test_create_experiment_answered_by_a_gateway_may_exist(
+def test_create_experiment_without_key_support_answered_by_a_gateway_may_exist(
     client: Client, mock_api: MockApi, answer: httpx.Response
 ) -> None:
-    mock_api.add("POST", EXP, answer)
+    mock_api.add("POST", EXP, key_refused(), answer)
     with pytest.raises(InsightMonError) as info:
         client.create_experiment(name="n", dataset_id="ds-1")
-    assert len(mock_api.requests) == 1  # still never retried
+    assert len(mock_api.requests) == 2  # still never retried without a key
     assert "may have been created" in info.value.message
 
 

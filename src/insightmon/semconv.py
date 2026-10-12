@@ -104,10 +104,11 @@ CONTENT_ATTRIBUTES: Final[tuple[str, ...]] = (
     TOOL_CALL_ARGUMENTS,
     TOOL_CALL_RESULT,
 )
-#: Content-like attributes of common third-party instrumentations. The platform keeps them in
-#: `attributes` even under `metadata_only`, so the SDK strips them when content capture is off.
-#: The list cannot be complete: check the attributes your instrumentations write and add their
-#: content attributes with `init(content_attributes=...)`.
+#: Content-like attributes of common third-party instrumentations: the platform's content
+#: attribute denylist. The platform drops them under `metadata_only` and redacts them otherwise
+#: (an older platform kept them as they were); the SDK strips them when content capture is off,
+#: so they never leave the process. The list cannot be complete: check the attributes your
+#: instrumentations write and add their content attributes with `init(content_attributes=...)`.
 THIRD_PARTY_CONTENT_ATTRIBUTES: Final[tuple[str, ...]] = (
     "input.value",
     "output.value",
@@ -120,7 +121,29 @@ THIRD_PARTY_CONTENT_ATTRIBUTES: Final[tuple[str, ...]] = (
     "langfuse.trace.output",
     "mlflow.spanInputs",
     "mlflow.spanOutputs",
+    "mlflow.chat.messages",
     "all_messages_events",
+    "ai.prompt",
+    "ai.prompt.messages",
+    "ai.response.text",
+    "ai.response.object",
+    "ai.response.toolCalls",
+    "ai.toolCall.args",
+    "ai.toolCall.result",
+    "ai.value",
+    "ai.values",
+    "ai.embedding",
+    "ai.embeddings",
+    "pydantic_ai.all_messages",
+    "final_result",
+    "tool_arguments",
+    "tool_response",
+    "request_data",
+    "response_data",
+    "gcp.vertex.agent.llm_request",
+    "gcp.vertex.agent.llm_response",
+    "gcp.vertex.agent.tool_call_args",
+    "gcp.vertex.agent.tool_response",
 )
 THIRD_PARTY_CONTENT_PREFIXES: Final[tuple[str, ...]] = (
     "gen_ai.prompt",
@@ -173,8 +196,10 @@ SERVER_ATTRIBUTES: Final[frozenset[str]] = frozenset(
 
 # --------------------------------------------------------------------------- experiments (SDK)
 
-#: Written by `evaluate()` on its per-item root span. The platform stores them as plain span
-#: attributes (it does not interpret them yet, see docs/contract.md §14).
+#: Written by `evaluate()` on its per-item root span. The platform marks a trace whose spans
+#: carry `insightmon.experiment_id` of an open client-run experiment that the ingesting key
+#: created as experiment traffic (an older platform stores it as a plain attribute); the other
+#: two are plain span attributes (docs/contract.md §8).
 EXPERIMENT_ID: Final = "insightmon.experiment_id"
 EXAMPLE_KEY: Final = "insightmon.example_key"
 TRIAL_INDEX: Final = "insightmon.trial_index"

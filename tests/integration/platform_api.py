@@ -158,6 +158,20 @@ class AdminSession:
         experiment: dict[str, Any] = self.get(self.p(f"/experiments/{experiment_id}"))
         return experiment
 
+    def experiments(self, dataset_id: str) -> list[dict[str, Any]]:
+        """Every experiment of a dataset (all pages)."""
+        out: list[dict[str, Any]] = []
+        cursor: str | None = None
+        while True:
+            params: dict[str, Any] = {"dataset_id": dataset_id, "limit": 200}
+            if cursor:
+                params["cursor"] = cursor
+            page = self.get(self.p("/experiments"), **params)
+            out.extend(page["items"])
+            cursor = page.get("next_cursor")
+            if not cursor:
+                return out
+
     def experiment_items(self, experiment_id: str) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = self.get(
             self.p(f"/experiments/{experiment_id}/items"), limit=200

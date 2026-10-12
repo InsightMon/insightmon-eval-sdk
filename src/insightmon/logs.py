@@ -11,6 +11,14 @@ raises `ValueError` before anything is sent: an empty name or one without any `[
 character, none or several of value / label / error_type, a non-finite value, no way to
 correlate the record. The explanation is cut to 4000 characters (the platform's cap).
 
+The platform refuses a record whose name is not a published score config (with the `span`,
+`trace` or `thread` level); its OTLP answer names the reason, not the name, and only the SDK's
+own exporter reads it. When the SDK exports to the platform, the first `log_evaluation()` of a
+runtime starts a background read of the published configs (`GET /api/v1/score-configs`, once
+per runtime; `log_evaluation()` never waits for it) and the SDK warns once per name the
+project does not have. A platform without that route, or a key without its scopes, means no
+check (the record is sent either way).
+
 OpenTelemetry compatibility: `LogRecordProcessor.on_emit` receives a `LogData` (with
 `.log_record`) in 1.35 and a `ReadWriteLogRecord` (also with `.log_record`) in later releases;
 `EventFilterProcessor` reads `event_name` / `attributes` through `.log_record` for both.
@@ -37,7 +45,7 @@ from opentelemetry.sdk._logs import LogRecordProcessor
 from opentelemetry.trace import INVALID_SPAN, NonRecordingSpan, Span, SpanContext
 
 from insightmon import semconv
-from insightmon._config import get_runtime
+from insightmon._config import RuntimeState, Settings, get_runtime
 from insightmon._version import __version__
 
 __all__ = ["EventFilterProcessor", "evaluation_attributes", "log_evaluation"]
@@ -45,11 +53,95 @@ __all__ = ["EventFilterProcessor", "evaluation_attributes", "log_evaluation"]
 _logger = logging.getLogger(__name__)
 _warned_lock = threading.Lock()
 _warned_names: set[str] = set()
+#: Subject levels a `log_evaluation()` score may take (its span, else the trace, else the thread).
+LOG_SCORE_LEVELS: tuple[str, ...] = ("span", "trace", "thread")
+#: Names noted before the published configs are known (beyond: not checked).
+_PENDING_NAMES_MAX = 1000
+
+
+class _NameCheck:
+    """The published score names of one runtime, read once in a background thread."""
+
+    def __init__(self, state: RuntimeState) -> None:
+        self.state = state
+        self.lock = threading.Lock()
+        self.done = False
+        self.names: frozenset[str] | None = None
+        self.pending: set[str] = set()
+
+    def note(self, name: str) -> None:
+        with self.lock:
+            if not self.done:
+                if len(self.pending) < _PENDING_NAMES_MAX:
+                    self.pending.add(name)
+                return
+            names = self.names
+        if names is not None and name not in names:
+            _warn_unknown(name)
+
+    def run(self) -> None:
+        try:
+            names = _fetch_score_names(self.state.settings)
+        except Exception:  # never fail the caller's process over a diagnostic
+            _logger.debug("insightmon: could not read the score configs", exc_info=True)
+            names = None
+        with self.lock:
+            self.done = True
+            self.names = names
+            pending, self.pending = sorted(self.pending), set()
+        if names is not None:
+            for name in pending:
+                if name not in names:
+                    _warn_unknown(name)
+
+
+_name_check: _NameCheck | None = None
+
+
+def _fetch_score_names(settings: Settings) -> frozenset[str] | None:
+    """Published score names usable by `log_evaluation()`, or None when the platform does not
+    say (tests replace this function)."""
+    from insightmon.client import Client, published_score_names
+
+    with Client(settings.base_url, settings.api_key, timeout=10.0, max_retries=1) as client:
+        return published_score_names(client, LOG_SCORE_LEVELS)
+
+
+def _check_name(state: RuntimeState, name: str) -> None:
+    """Note `name` for the background check of the runtime `state` (exporting to the
+    platform only)."""
+    global _name_check
+    if state.export_control is None:
+        return
+    start = False
+    with _warned_lock:
+        check = _name_check
+        if check is None or check.state is not state:
+            check = _name_check = _NameCheck(state)
+            start = True
+    check.note(name)
+    if start:
+        threading.Thread(target=check.run, name="insightmon-score-names", daemon=True).start()
+
+
+def _warn_unknown(name: str) -> None:
+    key = f"unknown:{name}"
+    with _warned_lock:
+        if key in _warned_names or len(_warned_names) >= _PENDING_NAMES_MAX:
+            return
+        _warned_names.add(key)
+    _logger.warning(
+        "insightmon: evaluation name %r is not a published score config of the project (for "
+        "spans, traces or threads); the platform drops these records: create and publish the "
+        "score config, or use another name",
+        name,
+    )
 
 
 def _reinit_after_fork() -> None:
-    global _warned_lock
+    global _warned_lock, _name_check
     _warned_lock = threading.Lock()
+    _name_check = None  # its thread did not survive the fork
 
 
 if hasattr(os, "register_at_fork"):
@@ -181,8 +273,10 @@ def log_evaluation(
 
     Args:
         name: the score name; the platform lower-cases it, replaces `[^a-z0-9_]` with `_` and
-            needs a published score config of that name (unknown names are dropped silently by
-            the platform, so the SDK warns once per name it had to normalize).
+            needs a published score config of that name (the platform refuses unknown names:
+            `rejections()` counts them; the SDK warns once per name it had to normalize, and
+            once per name the project's published configs do not have, when it can read
+            them).
         value: numeric value; a bool is sent as 1.0 / 0.0.
         label: label for boolean (pass / fail ...), categorical and text configs.
         explanation: cut to 4000 characters.
@@ -220,8 +314,9 @@ def log_evaluation(
     _warn_renamed(name, attributes[semconv.EVALUATION_NAME])
     state = get_runtime()
     provider = state.logger_provider if state is not None else None
-    if provider is None:
+    if state is None or provider is None:
         return
+    _check_name(state, attributes[semconv.EVALUATION_NAME])
     logger = provider.get_logger(semconv.INSTRUMENTATION_NAME, __version__)
     emit_event(logger, context, semconv.EVALUATION_RESULT_EVENT, attributes)
 

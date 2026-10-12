@@ -79,7 +79,7 @@ SDK 发给平台的每个属性名和事件名都在这里，和 `src/insightmon
 | `gen_ai.output.messages` | string（JSON 消息数组） | 单个字段 ≤ 256 KiB | `record_io(output_messages=)` | span 的 `output.messages` |
 | `gen_ai.tool.call.arguments` | string（JSON） | 单个字段 ≤ 256 KiB | 你或插桩（工具 span） | span 的 `input.arguments` |
 | `gen_ai.tool.call.result` | string（JSON） | 单个字段 ≤ 256 KiB | 你或插桩（工具 span） | span 的 `output.result` |
-| `input.value` | string | — | 第三方插桩 | 平台不解析，作为普通属性保存 |
+| `input.value` | string | — | 第三方插桩 | 平台不映射到 span 输入输出；`metadata_only` 下丢弃，否则入库脱敏（旧平台原样保存） |
 | `output.value` | string | — | 第三方插桩 | 同上 |
 | `llm.prompt_template.variables` | string | — | 第三方插桩（提示模板变量） | 同上 |
 | `traceloop.entity.input` | string | — | 第三方插桩（工作流 / 任务 span） | 同上 |
@@ -90,7 +90,29 @@ SDK 发给平台的每个属性名和事件名都在这里，和 `src/insightmon
 | `langfuse.trace.output` | string | — | 第三方插桩 | 同上 |
 | `mlflow.spanInputs` | string | — | 第三方插桩 | 同上 |
 | `mlflow.spanOutputs` | string | — | 第三方插桩 | 同上 |
+| `mlflow.chat.messages` | string | — | 第三方插桩 | 同上 |
 | `all_messages_events` | string | — | 第三方插桩 | 同上 |
+| `ai.prompt` | string | — | 第三方插桩（Vercel AI SDK） | 同上 |
+| `ai.prompt.messages` | string | — | 第三方插桩（Vercel AI SDK） | 同上 |
+| `ai.response.text` | string | — | 第三方插桩（Vercel AI SDK） | 同上 |
+| `ai.response.object` | string | — | 第三方插桩（Vercel AI SDK） | 同上 |
+| `ai.response.toolCalls` | string | — | 第三方插桩（Vercel AI SDK） | 同上 |
+| `ai.toolCall.args` | string | — | 第三方插桩（Vercel AI SDK） | 同上 |
+| `ai.toolCall.result` | string | — | 第三方插桩（Vercel AI SDK） | 同上 |
+| `ai.value` | string | — | 第三方插桩（Vercel AI SDK） | 同上 |
+| `ai.values` | string | — | 第三方插桩（Vercel AI SDK） | 同上 |
+| `ai.embedding` | string | — | 第三方插桩（Vercel AI SDK） | 同上 |
+| `ai.embeddings` | string | — | 第三方插桩（Vercel AI SDK） | 同上 |
+| `pydantic_ai.all_messages` | string | — | 第三方插桩（pydantic-ai） | 同上 |
+| `final_result` | string | — | 第三方插桩（pydantic-ai） | 同上 |
+| `tool_arguments` | string | — | 第三方插桩（pydantic-ai） | 同上 |
+| `tool_response` | string | — | 第三方插桩（pydantic-ai） | 同上 |
+| `request_data` | string | — | 第三方插桩（Logfire 的 OpenAI 集成） | 同上 |
+| `response_data` | string | — | 第三方插桩（Logfire 的 OpenAI 集成） | 同上 |
+| `gcp.vertex.agent.llm_request` | string | — | 第三方插桩（Google ADK） | 同上 |
+| `gcp.vertex.agent.llm_response` | string | — | 第三方插桩（Google ADK） | 同上 |
+| `gcp.vertex.agent.tool_call_args` | string | — | 第三方插桩（Google ADK） | 同上 |
+| `gcp.vertex.agent.tool_response` | string | — | 第三方插桩（Google ADK） | 同上 |
 | `gen_ai.prompt*` | any | — | 第三方插桩（旧的 GenAI 约定） | 同上 |
 | `gen_ai.completion*` | any | — | 第三方插桩（旧的 GenAI 约定） | 同上 |
 | `llm.input_messages*` | any | — | 第三方插桩 | 同上 |
@@ -103,9 +125,11 @@ SDK 发给平台的每个属性名和事件名都在这里，和 `src/insightmon
 
 - 消息的形状是 `{role, content}` 或 OTel 形状 `{role, parts: [{type: "text", content}]}`；`record_io()` 写 OTel 形状。
 - 标准内容属性也可以放在 span 事件 `gen_ai.client.inference.operation.details` 的属性上。
-- 第三方的内容类属性平台不映射到 span 的输入输出，在项目的 `metadata_only` 模式下也不会被平台丢弃，所以
-  SDK 在 `capture_content=False` 时自己删除它们（`*` 表示以此开头的所有属性）。这张表不可能列全：请检查你用的
-  插桩写了哪些带内容的属性，表里没有的用 `init(content_attributes=[...])` 补上（属性名，或以 `*` 结尾的前缀）。
+- 第三方的内容类属性平台不映射到 span 的输入输出。表里的第三方属性就是平台的内容属性清单：平台在项目的
+  `metadata_only` 模式下丢弃它们，其他模式下按入库脱敏规则处理（旧版平台原样保存）。SDK 在
+  `capture_content=False` 时在发送前自己删除它们（`*` 表示以此开头的所有属性），不依赖平台。这张表不可能列全：
+  请检查你用的插桩写了哪些带内容的属性，表里没有的用 `init(content_attributes=[...])` 补上（属性名，或以 `*`
+  结尾的前缀；平台不认识它们，`metadata_only` 也不会丢弃）。
 - 整个 span 的属性超过 64 KiB 时，平台从最大的键开始丢弃。
 
 ## 日志事件
@@ -148,12 +172,14 @@ SDK 发给平台的每个属性名和事件名都在这里，和 `src/insightmon
 
 ## 实验属性
 
-`evaluate()` 在每次运行的根 span（`evaluate`）上写下面三个属性。平台目前只把它们作为普通 span 属性保存
-（便于筛选），不解析；实验 trace 的归属由 trace id 决定。
+`evaluate()` 在每次运行的根 span（`evaluate`）上写下面三个属性。实验条目与 trace 的对应由条目上报的 trace id
+决定；平台另外读 `insightmon.experiment_id`：trace 的 span 带着一个仍在运行、由导入这些 span 的同一个 key 创建的
+客户端实验的 id 时，这个 trace 在条目上报之前就记为实验流量（不会先成为生产 trace，见 contract.md §8）。旧版平台
+只把它作为普通属性保存。另外两个属性始终是普通 span 属性（便于筛选）。
 
 | 属性 | 类型 | 取值 / 上限 | 谁来写 | 平台用途 |
 |---|---|---|---|---|
-| `insightmon.experiment_id` | string | 平台的实验 id | `evaluate()` / `aevaluate()` | 普通属性 |
+| `insightmon.experiment_id` | string | 平台的实验 id | `evaluate()` / `aevaluate()` | 把 trace 记为该实验的流量（旧版平台：普通属性） |
 | `insightmon.example_key` | string | ≤ 100 字符 | 同上 | 普通属性 |
 | `insightmon.trial_index` | int | 从 0 开始 | 同上 | 普通属性 |
 

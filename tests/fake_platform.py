@@ -44,6 +44,7 @@ class FakePlatform:
         polls_until_done: int = 2,
         score_names: frozenset[str] = frozenset({"short", "mentions_city", "length"}),
         score_max: float | None = None,
+        lists_configs: bool = False,
     ) -> None:
         self.keys = keys
         self.page_size = page_size
@@ -51,6 +52,8 @@ class FakePlatform:
         self.score_names = score_names
         #: numeric score values above this do not fit the score config (score_invalid)
         self.score_max = score_max
+        #: serve `GET /api/v1/score-configs` (otherwise 404, as on a platform without it)
+        self.lists_configs = lists_configs
         self.lock = threading.Lock()
         #: example key -> initial_state served with that example
         self.initial_states: dict[str, dict[str, Any]] = {}
@@ -69,6 +72,8 @@ class FakePlatform:
         mock_api.add("POST", BATCH, self.batch)
         mock_api.add("POST", FINALIZE, self.finalize)
         mock_api.add("GET", f"{EXP}/{EXP_ID}", self.get)
+        if self.lists_configs:
+            mock_api.add("GET", "/api/v1/score-configs", self.score_configs)
         mock_api.add(
             "GET",
             "/api/v1/api-key",
@@ -147,11 +152,7 @@ class FakePlatform:
                         {"example_key": ref[0], "reason": "already_reported"},
                     )
                 if not all(self.score_fits(score) for score in item.get("scores", [])):
-                    return error_response(
-                        400,
-                        "external_item_invalid",
-                        {"example_key": ref[0], "reason": "score_invalid"},
-                    )
+                    return self.score_invalid(item, items)
             for item in items:
                 ref = (item["example_key"], item["trial_index"])
                 if ref in self.reports:
@@ -168,6 +169,39 @@ class FakePlatform:
                     "item_ids": [f"item-{i}" for i in range(len(items))],
                 },
             )
+
+    def score_invalid(self, first: dict[str, Any], items: list[dict[str, Any]]) -> httpx.Response:
+        """The first offending item, with every offending score of the request listed."""
+        listed = [
+            {"example_key": i["example_key"], "trial_index": i["trial_index"], "name": s["name"]}
+            for i in items
+            if (i["example_key"], i["trial_index"]) not in self.reports
+            for s in i.get("scores", [])
+            if not self.score_fits(s)
+        ]
+        params = {
+            "example_key": first["example_key"],
+            "trial_index": first["trial_index"],
+            "reason": "score_invalid",
+            "invalid_scores": listed,
+        }
+        return error_response(400, "external_item_invalid", params)
+
+    def score_configs(self, request: httpx.Request) -> httpx.Response:
+        self.events.append("score-configs")
+        items = [
+            {
+                "name": name,
+                "data_type": "numeric",
+                "labels": None,
+                "min": None,
+                "max": self.score_max,
+                "subject_levels": ["experiment_item"],
+                "allow_unknown": False,
+            }
+            for name in sorted(self.score_names)
+        ]
+        return httpx.Response(200, json={"items": items})
 
     def score_fits(self, score: dict[str, Any]) -> bool:
         if score["name"] not in self.score_names:

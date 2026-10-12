@@ -42,8 +42,8 @@
 | `receipt` | `receipt() -> dict` | `propagation` |
 | `InsightMonASGIMiddleware` | `InsightMonASGIMiddleware(app, *, flush_on_traceparent=False, flush_when=None, flush_timeout_s=5.0)` | `propagation` |
 | `InsightMonWSGIMiddleware` | `InsightMonWSGIMiddleware(app, *, flush_on_traceparent=False, flush_when=None, flush_timeout_s=5.0)` | `propagation` |
-| `Client` | `Client(base_url=None, api_key=None, *, timeout=30.0, max_retries=3, report_retries=8, transport=None)`；方法 `api_key_info`、`scores_batch`、`create_experiment`、`get_experiment`、`list_examples`、`iter_examples`、`report_items`、`finalize_experiment`、`experiment_url`、`close` | `client` |
-| `ApiKeyInfo` / `Example` / `ExamplesPage` / `ReportResult` | 不可变数据类 | `client` |
+| `Client` | `Client(base_url=None, api_key=None, *, timeout=30.0, max_retries=3, report_retries=8, transport=None)`；方法 `api_key_info`、`scores_batch`、`score_configs`、`create_experiment(..., idempotency_key=None)`、`get_experiment`、`list_examples`、`iter_examples`、`report_items`、`finalize_experiment`、`experiment_url`、`close` | `client` |
+| `ApiKeyInfo` / `Example` / `ExamplesPage` / `ReportResult` / `ScoreConfig` | 不可变数据类 | `client` |
 | `evaluate` | `evaluate(task, *, dataset, dataset_version=None, example_keys=None, trials=1, evaluators=(), server_evaluators=(), name=None, requested=None, metadata=None, max_concurrency=4, timeout_s=None, api_key=None, base_url=None, wait=True, wait_timeout_s=1800.0, client=None) -> ExperimentResult` | `evaluate` |
 | `aevaluate` | 与 `evaluate` 相同，`async` | `evaluate` |
 | `ExperimentResult` / `ItemResult` | 数据类 | `evaluate` |
@@ -108,12 +108,14 @@ evaluate() ── Client + ItemBatcher + _TaskSlots + experiment_scope / release
 | 新增 `receipt()` | 回放时响应体里的 `receipt` 优先于 trace 属性，且不依赖 span 是否及时到达（contract §11） |
 | 中间件不创建服务端 span，增加 `flush_on_traceparent`、`flush_when`、`flush_timeout_s` | 保持轻量；`receipt_wait_s = 0` 时 span 必须在响应前送达，而几乎每个请求都带 `traceparent`，需要挑出回放请求并限制等待（contract §11） |
 | `log_evaluation(span=..., response_id=...)`；只给 `response_id` 时用空上下文发出 | 平台优先按 span 上下文关联；沾上当前 span 会关联错对象（contract §9.1） |
-| `InsightMonError` 增加 SDK 码 `connect_error` 与 `.delivered` | `POST /experiments` 没有幂等键，只能在“请求确定未送达”时重试（contract §14） |
+| `InsightMonError` 增加 SDK 码 `connect_error` 与 `.delivered` | 旧平台的 `POST /experiments` 没有幂等键，只能在“请求确定未送达”时重试（contract §6.1） |
+| `create_experiment()` 总是带 `idempotency_key`（`evaluate()` 每次运行一个），按幂等请求重试；平台对这个字段答 422 `extra_forbidden` 时去掉它重发，此后同一个 `Client` 退回只在连接失败与 429 时重试 | 新平台按幂等键返回已创建的实验；旧平台拒绝整个请求、什么也不建，所以带键的首次请求在任何平台上都可以安全重试，答复本身就说明平台是否支持（contract §6.1） |
+| 新增 `Client.score_configs()` 与 `published_score_names()`；`evaluate()` 每次运行、`log_evaluation()` 每个运行时（后台线程）各读一次，读不到时不检查 | 提前发现未发布的分数名，不再靠平台逐批拒绝；检查只是诊断，绝不能让调用失败（contract §5.1） |
 | `Client.report_items` 重试时发送完全相同的字节 | 平台按报告内容哈希去重，内容不同即 `already_reported`（contract §6.4） |
 | `Client.finalize_experiment` 重试遇到 409 `invalid_state status=finalized` 视为成功 | `:finalize` 第二次调用返回 409（contract §6.5） |
-| `evaluate()` 内不写会话键，暂存实验 trace 的 span，条目上报后再导出 | 先到的 span 会建出 `origin = otlp` 的生产 trace；平台不读 `insightmon.experiment_id`（contract §12、§14） |
+| `evaluate()` 内不写会话键，暂存实验 trace 的 span，条目上报后再导出 | 先到的 span 会建出 `origin = otlp` 的生产 trace（contract §12）。新平台读 `insightmon.experiment_id`（contract §8），但仍保留暂存，理由见下文 |
 | 请求按序列化大小拆分（OTLP 与 `items:batch`） | 全局 8 MiB 上限；OTel 导出器超限时整批丢弃（contract §14） |
-| `capture_content=False` 还删除第三方内容属性；`init()` 增加 `content_attributes` | `metadata_only` 下平台仍保存非标准内容属性（contract §10.2）；内置列表不可能覆盖所有插桩 |
+| `capture_content=False` 还删除第三方内容属性；`init()` 增加 `content_attributes` | 旧平台在 `metadata_only` 下仍保存非标准内容属性，新平台只丢弃它自己的清单（与 SDK 的内置列表相同，contract §10.2）；内容不应离开进程，内置列表也不可能覆盖所有插桩 |
 | `init()` 增加 `export_processor` | 经 Collector 转发时，实验 span 也要先暂存、条目上报后再导出，否则成为生产 trace（contract §14） |
 | 自己的 OTLP 导出器（httpx），不用 OpenTelemetry 的 OTLP/HTTP 导出器 | 通用 `OTEL_EXPORTER_OTLP_*HEADERS` 会把别家凭据发给平台；各版本重试集合不同；重定向被静默吞掉；不遵守期限（contract §0.1、§14） |
 | `flush()` / `shutdown()` 有真实期限，`flush()` 在导出失败时返回 `False` | 平台不可达时不能卡住进程退出、`evaluate()` 收尾和回放响应 |
@@ -129,6 +131,18 @@ evaluate() ── Client + ItemBatcher + _TaskSlots + experiment_scope / release
 | 新增 `rejections()` | 平台的部分拒绝只出现在响应体里，标准导出器看不到（contract §14） |
 | 导出 `Component`、`Settings`、`ThreadScope`、`InsightMonHandle` 与 `client` 数据类 | 出现在公共签名中 |
 
+**为什么在新平台上仍然暂存实验 span**：新平台的入库会把带 `insightmon.experiment_id` 的 trace 记为实验流量，
+条目先报、span 后到也能关联（contract §6.4、§8）。集成测试 `test_spans_before_the_report_become_experiment_traffic`
+关掉暂存验证了这一点。但不暂存只在下面几条同时成立时才不出错，SDK 无法保证：
+- 平台是新平台（旧平台不读这个属性，先到的 span 一律成为生产 trace）；
+- 导入 span 的 Key 就是创建实验的 Key（`init()` 用一个 Key、`evaluate(api_key=...)` 用另一个，或经 Collector
+  用 Collector 的 Key 导出时，平台忽略这个属性）；
+- 带属性的根 span 在 trace 的第一批里：SDK 只在根 span 上写这个属性，而根 span 最后结束，批处理器先导出的
+  子 span 会先建出一条生产 trace；那时 trace 一旦被在线规则派发（或加入会话），就不再转为实验流量。
+
+平台文档（`docs/dev/m4.md` §5.5）也把暂存写成 SDK 的默认做法。暂存的代价是条目上报前 span 留在内存里（有上限，
+contract §14），没有发现别的害处，所以保留。
+
 ## 5. 模块
 
 | 模块 | 内容 |
@@ -139,14 +153,14 @@ evaluate() ── Client + ItemBatcher + _TaskSlots + experiment_scope / release
 | `tracing` | `thread()`、`turn()`、`end_thread()`、`mark_eval_root()`、`set_component()`、`set_response_id()`、`get_tracer()` |
 | `processor` | `InsightMonSpanProcessor`：on_start 打属性；实验 trace 的 span 先暂存，释放时交给导出处理器，丢弃时（含之后晚到的 span）不导出；fork 后重置锁 |
 | `content` | `record_io()`、OTel 消息形状转换、保形压缩、内容属性判断 |
-| `logs` | `log_evaluation()`、`EventFilterProcessor`（只转发评估事件，开启内容采集时再加内容事件） |
+| `logs` | `log_evaluation()`（导出到平台时在后台检查一次名称）、`EventFilterProcessor`（只转发评估事件，开启内容采集时再加内容事件） |
 | `propagation` | `extract_context()`、`receipt()`、ASGI / WSGI 中间件（`flush_on_traceparent`） |
 | `_export` | SDK 自己的 OTLP/HTTP 导出器（httpx、四个请求头、重试、期限、重定向处理）、`ExportControl`、按请求大小拆分、内容删除、partial success 解析与 `rejections()` |
 | `_setup` | `init()` / `flush()` / `shutdown()`（带期限的 `_FlushGate`）、`InsightMonHandle`、进程退出时的 `shutdown()` |
 | `_errors` | `InsightMonError` 与错误码、重试分类 |
 | `_http` | JSON 编码与清洗（非有限数、孤立代理字符、深度上限）、`HttpTransport`（重试、`Retry-After`、错误映射、关闭插桩） |
-| `client` | `Client` 与数据类 |
-| `_batch` | `ItemBatcher`：条目分批上报；平台拒绝客户端分数时去掉被拒条目的分数重报（同一样例的多个 trial 分开发送），同一请求被拒 3 次后逐个发送，同一组名称被拒 3 次（且从未被接受）后不再随后续条目发送 |
+| `client` | `Client` 与数据类；`published_score_names()`（读不到评分定义时返回 None） |
+| `_batch` | `ItemBatcher`：条目分批上报；平台拒绝客户端分数时去掉 `invalid_scores` 列出的分数重报（旧平台：去掉被拒条目的全部分数，同一样例的多个 trial 分开发送），同一请求被拒 3 次后逐个发送，同一个名称（旧平台：同一组名称）被拒 3 次（且从未被接受）后不再随后续条目发送 |
 | `evaluate` | `evaluate()` / `aevaluate()`、结果类型、任务名额（`_TaskSlots`）、专用线程 |
 
 ### 模块之间的接缝
@@ -173,7 +187,8 @@ evaluate() ── Client + ItemBatcher + _TaskSlots + experiment_scope / release
 - 文档与示例：`tests/test_readme.py` 运行两个 README 中的每个 Python 代码块（两份 README 的代码块必须相同，
   快速开始必须等于 `examples/quickstart.py`）；`tests/test_examples.py` 运行三个示例；`tests/test_conventions.py`
   对照 `semconv` 检查 [conventions.md](conventions.md)；`tests/test_purity.py` 检查中性用词。
-- 单元测试不访问网络（只连 127.0.0.1）。
+- 单元测试不访问网络（只连 127.0.0.1）：自动夹具把 `log_evaluation()` 后台读取评分定义的函数
+  （`logs._fetch_score_names`）换成返回 None 的桩，集成测试除外。
 - 集成测试在 `tests/integration/`，标记 `integration`，没有 `INSIGHTMON_IT_*` 环境变量时跳过；`make test` 不运行它们。
   `scripts/integration.sh` 启动临时平台实例、创建 Key、运行它们并关闭平台；结果从平台的 REST API 读回
   （会话、trace、span、分数、实验条目与回执）。脚本创建的 Key 在结束时吊销（`tests/test_provision.py` 检查）。

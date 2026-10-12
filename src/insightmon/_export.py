@@ -22,8 +22,10 @@
   record that is still too large is dropped with a warning (and counted as a failure).
 - With content capture off, `ContentStrippingSpanExporter` removes content attributes
   (`semconv.is_content_attribute` plus `init(content_attributes=...)`) from spans and span
-  events, and drops content span events (`semconv.CONTENT_EVENTS`), before export: the
-  platform keeps non-standard content attributes even under `metadata_only`.
+  events, and drops content span events (`semconv.CONTENT_EVENTS`), before export: content
+  never leaves the process (an older platform keeps non-standard content attributes even under
+  `metadata_only`; the current one drops there the third-party content attributes `semconv`
+  lists, but not the ones added with `content_attributes`).
 - Partial success: the platform answers 200 with `partial_success {rejected_spans |
   rejected_log_records, error_message}` when it refuses part of a request (e.g. an evaluation
   result whose name is not a published score config: `score_config_not_found`). Each distinct

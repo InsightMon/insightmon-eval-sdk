@@ -1,11 +1,15 @@
 """`evaluate()` / `aevaluate()`: run a task on a dataset client-side; the platform runs the gating
 evaluators and draws the conclusion (external experiment, docs/contract.md §6 and §12).
 
-Flow: create the experiment (`triggered_by = "sdk"`), read its frozen examples, run the task
+Flow: create the experiment (`triggered_by = "sdk"`, with an idempotency key of this run, so
+that a create whose answer was lost is retried without creating a second experiment on a
+platform that takes the key), read its frozen examples, run the task
 on every (example, trial) with at most `max_concurrency` runs at once, each inside a new trace
 whose root is an `insightmon.turn("evaluate")` span carrying `insightmon.experiment_id /
 example_key / trial_index`; run the client evaluators once that turn has ended, outside its
-trace; report the items in batches (every 50 items or 5 s, `items:batch`); release the held
+trace; drop client scores whose names are not published score configs for experiment items
+(when the platform lists them: `GET /api/v1/score-configs`, read once per run, one warning per
+name); report the items in batches (every 50 items or 5 s, `items:batch`); release the held
 spans of each reported batch; flush telemetry; `:finalize`; poll until the platform finished
 the evaluation.
 
@@ -56,6 +60,7 @@ import logging
 import math
 import threading
 import time
+import uuid
 from collections.abc import Awaitable, Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -88,6 +93,7 @@ from insightmon.client import (
     is_already_finalized,
     normalize_evaluators,
     normalize_requested,
+    published_score_names,
 )
 
 __all__ = ["Evaluator", "ExperimentResult", "ItemResult", "Task", "aevaluate", "evaluate"]
@@ -896,6 +902,9 @@ class _Session:
         self.cancelled = threading.Event()
         self.slots = _TaskSlots(options.max_concurrency, self.experiment_id, options.timeout_s)
         self._holding_checked = False
+        #: client score names the project publishes for experiment items (None: not checked)
+        self.score_names: frozenset[str] | None = None
+        self._unknown_warned: set[str] = set()
         self.batcher = ItemBatcher(
             client,
             self.experiment_id,
@@ -928,6 +937,13 @@ class _Session:
             len(examples),
             len(self.runs),
         )
+
+    def load_score_names(self) -> None:
+        """Read the published score names once per run, when there are client evaluators (a
+        platform that does not list them: no local check, the platform refuses unknown names
+        at report time)."""
+        if self.options.evaluators:
+            self.score_names = published_score_names(self.client, ("experiment_item",))
 
     # ------------------------------------------------------------------ items
 
@@ -973,6 +989,7 @@ class _Session:
         receipt: dict[str, Any] | None = None,
     ) -> None:
         """Record the local result and queue the item report (unless the run is stopping)."""
+        scores = self._known_scores(scores)
         result = ItemResult(
             example_key=run.example.example_key,
             trial_index=run.trial_index,
@@ -1006,6 +1023,28 @@ class _Session:
         if self.stop.is_set():
             return  # stopping: an item that finished after the stop is not reported
         self.batcher.add(item)
+
+    def _known_scores(self, scores: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """`scores` without the names the project does not publish for experiment items."""
+        names = self.score_names
+        if names is None or not scores:
+            return scores
+        unknown = sorted({str(score["name"]) for score in scores} - names)
+        if not unknown:
+            return scores
+        with self._lock:
+            new = [name for name in unknown if name not in self._unknown_warned]
+            self._unknown_warned.update(new)
+        for name in new:
+            log.warning(
+                "insightmon: experiment %s: the client score %r is not a published score "
+                "config of the project for experiment items; it is not reported (publish a "
+                "score config of that name with the experiment_item level, or rename the "
+                "evaluator's score)",
+                self.experiment_id,
+                name,
+            )
+        return [score for score in scores if score["name"] in names]
 
     def _reported(self, items: Sequence[Mapping[str, Any]]) -> None:
         trace_ids: list[str] = []
@@ -1200,6 +1239,7 @@ def _create(client: Client, options: _Options) -> dict[str, Any]:
             evaluators=options.server_evaluators,
             triggered_by="sdk",
             metadata=options.metadata,
+            idempotency_key=uuid.uuid4().hex,  # one per run: retries never create a second one
         )
     except InsightMonError as err:
         if err.code == "permission_denied":
@@ -1404,8 +1444,10 @@ def evaluate(
     Task errors never raise: an exception is reported as `task_error` (`error.code =
     "exception"`), a late run as `timeout`. A failing client evaluator is logged and the item
     is reported without that score. Client scores are diagnostic only; their names must be
-    published score configs (otherwise the platform refuses them, and the SDK reports the item
-    without them and logs a warning).
+    published score configs with the `experiment_item` level: a score of another name is not
+    reported (checked against `GET /api/v1/score-configs` once per run when the platform has
+    it, otherwise the platform refuses it and the SDK reports the item without it), with one
+    warning per name.
     """
     options = _Options.build(
         task,
@@ -1428,6 +1470,7 @@ def evaluate(
         session = _Session(active, options, _create(active, options))
         try:
             session.plan(list(active.iter_examples(session.experiment_id)))
+            session.load_score_names()
             _run_all_sync(session)
         except BaseException as exc:
             error = session.abort(exc)
@@ -1496,6 +1539,7 @@ async def aevaluate(
         try:
             examples = await _off_loop(lambda: list(active.iter_examples(session.experiment_id)))
             session.plan(examples)
+            await _off_loop(session.load_score_names)
             await _run_all_async(session)
         except BaseException as exc:
             error = await _to_the_end(session.abort, exc)

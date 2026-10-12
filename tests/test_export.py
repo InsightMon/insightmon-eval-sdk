@@ -254,7 +254,19 @@ THIRD_PARTY_CONTENT = [
     "langfuse.trace.output",
     "mlflow.spanInputs",
     "mlflow.spanOutputs",
+    "mlflow.chat.messages",
     "all_messages_events",
+    "ai.prompt.messages",
+    "ai.response.text",
+    "ai.toolCall.args",
+    "ai.embeddings",
+    "pydantic_ai.all_messages",
+    "final_result",
+    "tool_arguments",
+    "request_data",
+    "response_data",
+    "gcp.vertex.agent.llm_request",
+    "gcp.vertex.agent.tool_response",
 ]
 #: Look-alikes that carry no message content and must be kept.
 NOT_CONTENT = [
@@ -264,6 +276,9 @@ NOT_CONTENT = [
     "traceloop.entity.name",
     "langfuse.observation.type",
     "mlflow.spanType",
+    "ai.model.id",
+    "ai.usage.promptTokens",
+    "gcp.vertex.agent.invocation_id",
     semconv.REQUEST_MODEL,
 ]
 

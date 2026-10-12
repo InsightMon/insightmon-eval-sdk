@@ -3,6 +3,32 @@
 格式参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循
 [语义化版本](https://semver.org/lang/zh-CN/)。1.0 之前，次版本号的变化可能包含不兼容的改动，会在这里写明。
 
+## [未发布]
+
+对接平台的 `fix/sdk-platform-gaps` 改动（数据库迁移 0009，docs/contract.md 开头的“新平台”）；在更早的平台上
+自动退回原来的做法。
+
+### 新增
+
+- `Client.create_experiment(..., idempotency_key=None)`：总是带一个幂等键（不给时随机生成，`evaluate()` 每次
+  运行生成一个），读超时、网络错误与 5xx 也重试，平台对同一个键返回已经建好的实验。平台不认这个字段（422）时
+  去掉它重发，此后同一个 `Client` 照旧只在请求确定没有送达时重试。重试用完仍不确定时，错误的
+  `params.idempotency_key` 给出可以重用的键。
+- `Client.score_configs()` 与数据类 `ScoreConfig`（`GET /api/v1/score-configs`）。`evaluate()` 有客户端评估器时
+  每次运行读一次，名称不是已发布、允许实验条目层级的评分定义的分数不上报，每个名称记一条 warning；
+  `log_evaluation()` 在导出到平台时于后台读一次，对未知名称各记一条 warning（记录照常发送）。平台没有这个接口或
+  Key 无权读取时都不检查。
+
+### 变更
+
+- `items:batch` 拒绝客户端分数（`score_invalid`）时，按平台列出的 `invalid_scores` 只去掉无效的分数，重发一次；
+  按 `trial_index` 匹配被拒的条目。平台不列出时保留原来的逐条处理。
+- 内置的第三方内容属性列表与平台的清单同步：新增 `mlflow.chat.messages`、Vercel AI SDK 的 `ai.*`
+  内容属性、pydantic-ai / Logfire 的 `pydantic_ai.all_messages`、`final_result`、`tool_arguments`、
+  `tool_response`、`request_data`、`response_data`，以及 Google ADK 的 `gcp.vertex.agent.*` 内容属性。
+- 文档：契约（docs/contract.md）§13 的差异标为已同步，§14 分成“新平台已修复”与“仍然存在”；README 中 SQLite
+  回放的限制只针对旧平台。`evaluate()` 仍然暂存实验 span（理由见 docs/design.md §4）。
+
 ## [0.1.0] - 2026-10-12
 
 第一个版本。对接 [InsightMon/insightmon-ai-eval](https://github.com/InsightMon/insightmon-ai-eval) 当前
@@ -74,11 +100,12 @@
 ### 已知限制
 
 - 平台使用 SQLite 时，回放回执不能依赖 `flush_on_traceparent`（平台在等待响应期间持有数据库写锁），
-  见 README 的“回放回执”。
-- 平台目前不解析 `insightmon.experiment_id` / `example_key` / `trial_index`，只作为普通属性保存。
+  见 README 的“回放回执”（新平台已修复）。
+- 平台目前不解析 `insightmon.experiment_id` / `example_key` / `trial_index`，只作为普通属性保存（新平台读取
+  `insightmon.experiment_id`）。
 - 线程池中需要手动传递上下文（`contextvars.copy_context()`），见 README。
 - 平台的 `external_item_invalid` 不带 `trial_index`：`trials` > 1 时 SDK 把同一样例的几个 trial 分开上报以区分
-  被拒的条目，多花几个请求（docs/contract.md §14）。
+  被拒的条目，多花几个请求（docs/contract.md §14；新平台已修复）。
 - span 处理器在线程池中运行（`ConcurrentMultiSpanProcessor`）时，SDK 无法打属性和暂存 span。
 - 插桩以日志事件发出的内容只有经 `init(logger_provider=...)` 传入的 provider 才会转发。
 - 超时的同步任务无法被终止：它在返回之前一直占用一个并发名额。

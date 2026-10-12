@@ -5,15 +5,23 @@ Retries follow docs/contract.md §0.1 (see `insightmon._http`):
 
 - GETs, `items:batch` (deduplicated by report content), `scores:batch` (the SDK fills an
   `idempotency_key` into every score) and `:finalize` retry 429, 5xx and network errors;
-- `POST /experiments` has no idempotency key on the platform: it is retried only when the
-  connection never opened or on 429 `rate_limited`.
+- `POST /experiments` carries an `idempotency_key` too and is retried the same way. A platform
+  that predates the key refuses the field (422 `validation_error`, nothing created); the SDK
+  then sends the request without it, retried only when the connection never opened or on 429
+  `rate_limited` (a retry could create a second experiment there).
+
+`score_configs()` lists the published score configs of the key's project (`GET
+/api/v1/score-configs`); `published_score_names()` turns that into the names usable at some
+subject levels, or None when the platform does not answer it (a platform without the route,
+a key without its scopes): callers then leave the checks to the platform.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 import uuid
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from types import TracebackType
 from typing import Any, Literal, TypeVar
@@ -40,7 +48,9 @@ from insightmon._errors import (
 )
 from insightmon._http import HttpTransport, encode_json
 
-__all__ = ["ApiKeyInfo", "Client", "Example", "ExamplesPage", "ReportResult"]
+__all__ = ["ApiKeyInfo", "Client", "Example", "ExamplesPage", "ReportResult", "ScoreConfig"]
+
+log = logging.getLogger("insightmon")
 
 API_PREFIX = "/api/v1"
 #: Sources an API key may write (`scores:batch`); anything else is 400
@@ -119,6 +129,37 @@ class ExamplesPage:
 
 
 @dataclass(frozen=True)
+class ScoreConfig:
+    """One published score config of the key's project (`GET /api/v1/score-configs`).
+
+    `labels`: the categories of a categorical config (None: any label); `min` / `max`: the
+    range of a numeric one; `subject_levels`: what a score may be about (`span`, `trace`,
+    `thread`, `experiment_item`); `allow_unknown`: `unscored` with `judge_unknown` is accepted.
+    """
+
+    name: str
+    data_type: str
+    labels: tuple[str, ...] | None = None
+    min: float | None = None
+    max: float | None = None
+    subject_levels: tuple[str, ...] = ()
+    allow_unknown: bool = False
+
+    @classmethod
+    def from_json(cls, data: Mapping[str, Any]) -> ScoreConfig:
+        labels = data.get("labels")
+        return cls(
+            name=str(data["name"]),
+            data_type=str(data["data_type"]),
+            labels=tuple(str(label) for label in labels) if isinstance(labels, list) else None,
+            min=_number(data.get("min")),
+            max=_number(data.get("max")),
+            subject_levels=tuple(str(level) for level in data.get("subject_levels") or ()),
+            allow_unknown=bool(data.get("allow_unknown")),
+        )
+
+
+@dataclass(frozen=True)
 class ReportResult:
     """`items:batch` totals over every request the call made. `item_ids` are not in request
     order (the platform lists new items first, then duplicates)."""
@@ -161,6 +202,8 @@ class Client:
         if report_retries < 0:
             raise ValueError("report_retries must be >= 0")
         self._report_retries = report_retries
+        #: False once the platform refused `idempotency_key` on `POST /experiments` (older)
+        self._experiment_keys = True
         settings = get_settings()
         url = base_url or (settings.base_url if settings is not None else None)
         url = url or os.environ.get(ENV_BASE_URL) or None
@@ -246,6 +289,18 @@ class Client:
             offset += len(chunk)
         return out
 
+    def score_configs(self) -> list[ScoreConfig]:
+        """`GET /api/v1/score-configs` (scope `score_write`, `experiment_write` or
+        `trace_ingest`): the published score configs of the key's project, by name. A platform
+        without this route answers 404 `not_found` (see `published_score_names()`)."""
+        data = self._object("GET", "/score-configs")
+        items = data.get("items")
+        if not isinstance(items, list):
+            raise InsightMonError(
+                UNEXPECTED_RESPONSE, None, "GET /api/v1/score-configs answered no items"
+            )
+        return [_parse(ScoreConfig.from_json, item, "GET /api/v1/score-configs") for item in items]
+
     # ------------------------------------------------------------------ experiments
 
     def create_experiment(
@@ -260,16 +315,25 @@ class Client:
         evaluators: Sequence[Mapping[str, Any]] = (),
         triggered_by: Literal["sdk", "ci"] = "sdk",
         metadata: Mapping[str, Any] | None = None,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         """`POST /api/v1/experiments` (scope `experiment_write`): returns the experiment.
 
-        Not idempotent on the platform: retried only on `connect_error` and 429
-        `rate_limited`. Fields are validated locally against the platform limits first
-        (ValueError). `requested.components` may be `Component`s or mappings; their
-        `content_hash` is dropped (the platform refuses it). When the request was sent but no
-        answer from the platform came back (`timeout`, `network_error`, a gateway's 502 / 504,
-        or a 5xx that is not the platform's error envelope), the error says that the
-        experiment may exist: look it up before calling again.
+        The request carries `idempotency_key` (a random one when not given, 1 to 128
+        characters). The platform answers a request with the same key and content with the
+        experiment it already created, so the request is retried like an idempotent one
+        (timeouts, broken connections, 429, 5xx); the same key with other content is 409
+        `idempotency_key_conflict`. A platform that predates the key refuses the field (422,
+        nothing created): the request is then sent once more without it and retried only on
+        `connect_error` and 429 `rate_limited`, and later calls of this client send no key.
+
+        Fields are validated locally against the platform limits first (ValueError).
+        `requested.components` may be `Component`s or mappings; their `content_hash` is
+        dropped (the platform refuses it). When the request was sent but no answer from the
+        platform came back (`timeout`, `network_error`, a gateway's 502 / 504, or a 5xx that is
+        not the platform's error envelope) and retries did not help, the error says that the
+        experiment may exist (its `params` carry the `idempotency_key` that was sent, if any):
+        create it again with that key, or look it up before calling again.
         """
         body: dict[str, Any] = {
             "name": _text("name", name, semconv.EXPERIMENT_NAME_MAX),
@@ -293,19 +357,47 @@ class Client:
             if not isinstance(metadata, Mapping):
                 raise ValueError("metadata must be a mapping or None")
             body["metadata"] = dict(metadata)
+        key = uuid.uuid4().hex if idempotency_key is None else idempotency_key
+        _text("idempotency_key", key, semconv.IDEMPOTENCY_KEY_MAX)
+        if self._experiment_keys:
+            try:
+                return self._create({**body, "idempotency_key": key}, key)
+            except InsightMonError as err:
+                if not _idempotency_key_refused(err):
+                    raise
+            self._experiment_keys = False
+            log.info(
+                "insightmon: the platform does not take idempotency keys for experiments "
+                "(an older version); creating the experiment without one, retried only when "
+                "the connection never opened"
+            )
+        return self._create(body, None)
+
+    def _create(self, body: dict[str, Any], key: str | None) -> dict[str, Any]:
+        """One `POST /experiments`: idempotent (retried) when `body` carries `key`."""
         try:
             data = self._object(
-                "POST", "/experiments", json_body=body, idempotent=False, expected=(201,)
+                "POST", "/experiments", json_body=body, idempotent=key is not None, expected=(201,)
             )
         except InsightMonError as err:
-            if _may_have_acted(err):
+            if not _may_have_acted(err):
+                raise
+            if key is None:
                 raise with_message(
                     err,
                     f"{err.message or err.code}; the request reached the server, so the "
                     "experiment may have been created: check the experiments page before "
                     "creating it again",
                 ) from err
-            raise
+            raise with_params(
+                with_message(
+                    err,
+                    f"{err.message or err.code}; the request reached the server, so the "
+                    f"experiment may have been created: create it again with idempotency_key="
+                    f"{key!r} and the same arguments to get it, or check the experiments page",
+                ),
+                {**err.params, "idempotency_key": key},
+            ) from err
         experiment = data.get("experiment")
         if not isinstance(experiment, dict) or not isinstance(experiment.get("id"), str):
             raise InsightMonError(
@@ -634,6 +726,36 @@ def _prepare_score(score: Any, index: int) -> dict[str, Any]:
 GATEWAY_STATUSES: frozenset[int] = frozenset({502, 504})
 
 
+def published_score_names(client: Client, levels: Collection[str]) -> frozenset[str] | None:
+    """Names of the published score configs that take a score on one of `levels`
+    (`Client.score_configs()`), or None when the platform does not say: a platform without the
+    route (404), a key without one of its scopes (403), or any other failure. Never raises a
+    platform error: the platform checks the names itself either way."""
+    try:
+        configs = client.score_configs()
+    except InsightMonError as err:
+        log.debug("insightmon: score configs not available (%s); names are not checked", err)
+        return None
+    wanted = set(levels)
+    return frozenset(c.name for c in configs if wanted.intersection(c.subject_levels))
+
+
+def _idempotency_key_refused(error: InsightMonError) -> bool:
+    """422 for the field `idempotency_key` itself (`extra_forbidden`): a platform whose
+    experiment schema predates the key. It refused the whole request, so nothing was
+    created."""
+    if error.status != 422:
+        return False
+    errors = error.params.get("errors")
+    return isinstance(errors, list) and any(
+        isinstance(entry, Mapping)
+        and isinstance(entry.get("loc"), list)
+        and entry["loc"][-1:] == ["idempotency_key"]
+        and entry.get("type") == "extra_forbidden"
+        for entry in errors
+    )
+
+
 def _may_have_acted(error: InsightMonError) -> bool:
     """Whether a failed request that is not idempotent may still have been carried out: no
     answer came back, or the answer came from a gateway rather than the platform (502 / 504,
@@ -645,6 +767,12 @@ def _may_have_acted(error: InsightMonError) -> bool:
     return error.status in GATEWAY_STATUSES or (
         error.status >= 500 and error.code == UNEXPECTED_RESPONSE
     )
+
+
+def _number(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    return float(value)
 
 
 def _id(value: str) -> str:

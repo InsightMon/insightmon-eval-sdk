@@ -42,6 +42,66 @@ def test_content_attributes() -> None:
     assert not semconv.is_content_attribute(semconv.AGENT_VERSION)
 
 
+#: The platform's content attribute denylist (`CONTENT_ATTRIBUTE_DENYLIST`, `*`: a prefix):
+#: what it drops under `metadata_only`. The SDK strips at least these with capture off.
+PLATFORM_DENYLIST = (
+    "gen_ai.prompt",
+    "gen_ai.prompt.*",
+    "gen_ai.completion",
+    "gen_ai.completion.*",
+    "traceloop.entity.input",
+    "traceloop.entity.output",
+    "input.value",
+    "output.value",
+    "llm.input_messages",
+    "llm.input_messages.*",
+    "llm.output_messages",
+    "llm.output_messages.*",
+    "llm.prompts",
+    "llm.prompts.*",
+    "llm.prompt_template.variables",
+    "retrieval.documents.*",
+    "reranker.input_documents.*",
+    "reranker.output_documents.*",
+    "embedding.embeddings.*",
+    "langfuse.observation.input",
+    "langfuse.observation.output",
+    "langfuse.trace.input",
+    "langfuse.trace.output",
+    "mlflow.spanInputs",
+    "mlflow.spanOutputs",
+    "mlflow.chat.messages",
+    "all_messages_events",
+    "ai.prompt",
+    "ai.prompt.messages",
+    "ai.response.text",
+    "ai.response.object",
+    "ai.response.toolCalls",
+    "ai.toolCall.args",
+    "ai.toolCall.result",
+    "ai.value",
+    "ai.values",
+    "ai.embedding",
+    "ai.embeddings",
+    "pydantic_ai.all_messages",
+    "final_result",
+    "tool_arguments",
+    "tool_response",
+    "request_data",
+    "response_data",
+    "gcp.vertex.agent.llm_request",
+    "gcp.vertex.agent.llm_response",
+    "gcp.vertex.agent.tool_call_args",
+    "gcp.vertex.agent.tool_response",
+)
+
+
+@pytest.mark.parametrize("entry", PLATFORM_DENYLIST)
+def test_the_platform_denylist_is_stripped(entry: str) -> None:
+    key = entry[:-1] + "0.content" if entry.endswith("*") else entry
+    assert semconv.is_content_attribute(key)
+
+
 def test_thread_key_priority_order() -> None:
     assert semconv.THREAD_KEY_ATTRIBUTES[0] == semconv.GEN_AI_CONVERSATION_ID
 

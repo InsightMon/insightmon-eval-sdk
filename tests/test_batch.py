@@ -397,6 +397,76 @@ def test_a_score_name_the_platform_accepted_is_never_dropped_up_front(
     assert final == [item("later", scores=scored(0.7))]
 
 
+def listing_platform(requests: list[list[tuple[str, int]]] | None = None) -> Any:
+    """A platform that lists every offending score of the request in `invalid_scores`: the
+    published names are `short` and `accuracy` (range [0, 1])."""
+
+    def invalid(score: Mapping[str, Any]) -> bool:
+        if score["name"] == "accuracy":
+            return not 0 <= score["value"] <= 1
+        return score["name"] != "short"
+
+    def platform(request: httpx.Request) -> httpx.Response:
+        items = json.loads(request.content)["items"]
+        if requests is not None:
+            requests.append([(i["example_key"], i["trial_index"]) for i in items])
+        listed = [
+            {"example_key": i["example_key"], "trial_index": i["trial_index"], "name": s["name"]}
+            for i in items
+            for s in i.get("scores", [])
+            if invalid(s)
+        ]
+        if listed:
+            first = {k: listed[0][k] for k in ("example_key", "trial_index")}
+            params = {**first, "reason": "score_invalid", "invalid_scores": listed}
+            return error_response(400, "external_item_invalid", params)
+        return accept_all(request)
+
+    return platform
+
+
+def test_listed_invalid_scores_are_dropped_in_one_resend(
+    client: Client, mock_api: MockApi, caplog: pytest.LogCaptureFixture
+) -> None:
+    requests: list[list[tuple[str, int]]] = []
+    mock_api.add("POST", PATH, listing_platform(requests))
+    reported: list[Mapping[str, Any]] = []
+    batcher = ItemBatcher(
+        client, "exp-1", max_items=10, timer=False, on_reported=lambda items: reported.extend(items)
+    )
+    short = {"name": "short", "value": True}
+    batcher.add(item("a", 0, scores=[{"name": "unknown", "value": 1}, short]))
+    batcher.add(item("a", 1, scores=[*scored(1.5), short]))
+    batcher.add(item("a", 2, scores=scored(0.4)))
+    batcher.add(item("b", 0, scores=[{"name": "unknown", "value": 2}]))
+    batcher.flush()
+    everything = [("a", 0), ("a", 1), ("a", 2), ("b", 0)]
+    assert requests == [everything, everything]  # trials are told apart by the platform
+    final = {(i["example_key"], i["trial_index"]): i.get("scores") for i in reported}
+    assert final == {
+        ("a", 0): [short],  # only the listed score is dropped
+        ("a", 1): [short],
+        ("a", 2): scored(0.4),
+        ("b", 0): None,
+    }
+    assert batcher._refusals == {frozenset({"unknown"}): 2, frozenset({"accuracy"}): 1}
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 2  # one per name
+    assert batcher.error is None
+
+
+def test_a_listed_name_refused_repeatedly_is_dropped_for_the_rest_of_the_run(
+    client: Client, mock_api: MockApi
+) -> None:
+    mock_api.add("POST", PATH, listing_platform())
+    batcher = ItemBatcher(client, "exp-1", max_items=1, timer=False)
+    short = {"name": "short", "value": True}
+    for key in "abcd":
+        batcher.add(item(key, scores=[{"name": "unknown", "value": 1}, short]))
+    assert len(mock_api.requests) == 2 * _batch.REFUSALS_BEFORE_DROP + 1
+    assert mock_api.json_bodies("POST", PATH)[-1]["items"] == [item("d", scores=[short])]
+
+
 def test_score_invalid_for_an_item_without_scores_raises(client: Client, mock_api: MockApi) -> None:
     mock_api.add(
         "POST",

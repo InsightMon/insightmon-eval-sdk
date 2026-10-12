@@ -309,9 +309,11 @@ Notes:
 - the log processor forwards evaluation result events only, never message content events;
 - `record_io()` does nothing and returns `False`.
 
-**Attributes outside that list are sent as they are**, and the platform keeps such non-standard
-attributes even in `metadata_only` mode. Check which content attributes your instrumentations write,
-and add the missing ones with `content_attributes` (attribute names, or prefixes ending in `*`):
+**Attributes outside that list are sent as they are**: the platform's `metadata_only` mode drops only
+the standard content attributes and this third-party list, and keeps attributes it does not know (an
+older platform keeps the listed third-party ones too). Check which content attributes your
+instrumentations write, and add the missing ones with `content_attributes` (attribute names, or
+prefixes ending in `*`):
 
 ```python
 import insightmon
@@ -357,7 +359,8 @@ with insightmon.thread("chat-45"), insightmon.turn():
   use to `init(logger_provider=...)`. A `LoggerProvider` the SDK creates itself serves
   `log_evaluation()` only; instrumentations never see it.
 - The platform has its own switch: with the project's content capture mode `metadata_only` it stores
-  no standard message content. The platform applies its own redaction on ingest.
+  no standard message content and none of the listed third-party content attributes. The platform
+  applies its own redaction on ingest (to the third-party content attributes too).
 
 ## Evaluation logs
 
@@ -378,7 +381,11 @@ insightmon.log_evaluation("mentions_city", label="pass", span=span)
 - **The name must be a published score config of the project** (sidebar "Score configs"). The
   platform lowercases names and replaces characters outside `[a-z0-9_]` with `_`. Unknown names are
   refused: the SDK reads the OTLP partial success response, logs one warning per reason (e.g.
-  `score_config_not_found`) and counts it in `insightmon.rejections()`.
+  `score_config_not_found`) and counts it in `insightmon.rejections()`. When exporting to the
+  platform, the SDK also reads the project's published score configs once in the background
+  (`GET /api/v1/score-configs`, once per `init()`, never blocking the call) and logs one warning per
+  name the project does not have; a platform without that endpoint, or a key that may not read it,
+  means no check. The records are sent either way.
 - Give exactly one of `value`, `label` and `error_type`; `error_type` means the evaluator itself
   failed (stored as an unscored score).
 - Linking: pass `span=` (or call it inside the evaluated span); without the span, pass
@@ -478,12 +485,17 @@ print(result.status, result.pass_rate, result.url)
 - **Client evaluators** are diagnostic and never change the verdict. They run after the item's turn
   has ended, outside the item's trace: spans they start (e.g. an instrumented model call) are
   dropped, so they never mix into the agent trajectory the platform's evaluators read and never
-  become production traces. **Their names must be published score configs** and their values must
-  fit them, otherwise the platform refuses those scores and the SDK reports the item again without
-  them and logs a warning (after the same set of names is refused 3 times and the platform never
-  accepted it, the rest of the run's items are reported without them right away); with `trials` > 1,
-  an invalid score of one trial never costs another trial its scores. Score metadata keys the
-  platform reserves (`adjudicated`, `accepted_by`, ...) are dropped with a warning.
+  become production traces. **Their names must be published score configs that allow the
+  experiment item level**: with client evaluators, the SDK reads the published score configs once
+  per run (`GET /api/v1/score-configs`) and does not report a score of another name, with one
+  warning per name (skipped on a platform without that endpoint, or with a key that may not read
+  it). Their values must fit the configs, otherwise the platform refuses those scores and lists
+  each of them; the SDK drops exactly the listed scores, reports once more and logs a warning (an
+  older platform names only the first item: the SDK then drops all client scores of that item, and
+  after the same name is refused 3 times and the platform never accepted it, the rest of the run's
+  items are reported without it right away); with `trials` > 1, an invalid score of one trial never
+  costs another trial its scores. Score metadata keys the platform reserves (`adjudicated`,
+  `accepted_by`, ...) are dropped with a warning.
 - **Server evaluators** are evaluator version ids published on the platform (gating), or
   `{"evaluator_version_id": ..., "role": "diagnostic"}`.
 - **Timeouts and concurrency**: when `timeout_s` passes, the run is recorded as `timeout`; but a thread
@@ -493,15 +505,21 @@ print(result.status, result.pass_rate, result.url)
   stops (not finalized) with a `RuntimeError` naming the experiment id.
 - Each run has its own trace (root span `evaluate`) containing the spans your task creates; the SDK
   exports them after the item is reported, the platform merges them into the experiment trace
-  (`origin = experiment`), and they never show up in production threads. Through a Collector this
-  needs `init(export_processor=...)` (see [Existing OpenTelemetry setups](#existing-opentelemetry-setups)),
-  otherwise the spans cannot be held and `evaluate()` logs a warning.
+  (`origin = experiment`), and they never show up in production threads. The platform also reads
+  `insightmon.experiment_id` on the root span, but only for experiments the same key created and
+  only once that root span arrived (it ends last), so the SDK still holds the spans. Through a
+  Collector this needs `init(export_processor=...)` (see
+  [Existing OpenTelemetry setups](#existing-opentelemetry-setups)), otherwise the spans cannot be held
+  and `evaluate()` logs a warning.
 - **Report retries**: `items:batch` and `:finalize` are idempotent, so the SDK retries them up to 8
   times on 429, 5xx and network errors (about 40 seconds of backoff in all, plus any `Retry-After`;
   set it with `Client(report_retries=...)`), and a short platform outage does not stop the run.
-  Creating the experiment has no idempotency key and is retried only when the request surely did not
-  arrive; after a gateway 502 / 504, a read timeout and the like, the experiment may exist, and the
-  error message says to check the experiments page first.
+  Creating the experiment carries an idempotency key made for the run and is retried on read
+  timeouts, 5xx and network errors too: the platform answers the same key and content with the
+  experiment it already created, never a second one. An older platform does not take the key (it
+  answers 422 and creates nothing); the SDK then creates the experiment without one, retried only
+  when the request surely did not arrive, and after a gateway 502 / 504, a read timeout and the like
+  the experiment may exist there: the error message says to check the experiments page first.
 - `result.url` is the experiment page on the platform; `result.items` holds every run as recorded
   locally (status, output, latency, trace id, client scores); with `wait=False` it does not wait for
   the platform's evaluation.
@@ -618,10 +636,11 @@ requests with a `traceparent`. The WSGI middleware exports before the server get
 the response: right after the application returns a list, or by reading one chunk ahead for a
 streamed response (which is then sent one chunk later).
 
-**Do not export before the response when the platform runs on SQLite**: the platform holds the
-database write lock while it waits for the response, so the export blocks until it times out, the
-item is recorded as `timeout` and the spans are lost. On SQLite leave `flush_on_traceparent` /
-`flush_when` off and set `receipt_wait_s` to at least a few seconds; on PostgreSQL both work.
+**Do not export before the response when an older platform runs on SQLite**: a platform before
+migration 0009 holds the database write lock while it waits for the response, so the export blocks
+until it times out, the item is recorded as `timeout` and the spans are lost. On such a platform
+leave `flush_on_traceparent` / `flush_when` off and set `receipt_wait_s` to at least a few seconds.
+The current platform commits before it calls the service, so both work on SQLite and PostgreSQL.
 
 ## Configuration
 
@@ -696,8 +715,12 @@ spans. The handle `init()` returns also works as a context manager.
 - **The thread does not close**: the last turn has no `end_thread`; the platform closes idle threads.
 - **Warning `the platform refused N log records: score_config_not_found`**: an evaluation name has no
   published score config; `insightmon.rejections()` keeps the counts.
-- **Client scores of `evaluate()` are missing**: likewise, names must be published score configs; the
-  warning names the refused scores.
+- **Warning `evaluation name '...' is not a published score config`**: a `log_evaluation()` name has
+  no published score config in the project (or its config allows no span, trace or thread level);
+  the platform refuses these records.
+- **Client scores of `evaluate()` are missing**: likewise, names must be published score configs that
+  allow the experiment item level; the warning (`the client score '...' is not a published score
+  config` or `the platform refused the client score`) names them.
 - **An interrupted `evaluate()` leaves the experiment open**: see
   [Interruption](#interruption-ctrl-c--cancel) and finish it with `Client().finalize_experiment(id)`.
 - **`evaluate()` raises a `RuntimeError` about timed-out tasks that still run**: a downstream service
@@ -707,13 +730,15 @@ spans. The handle `init()` returns also works as a context manager.
   a processor you added to the provider yourself, so the SDK cannot hold them; use
   `init(export_processor=...)` instead (see [Existing OpenTelemetry setups](#existing-opentelemetry-setups)).
 - **Creating the experiment fails with `the experiment may have been created`**: the request reached
-  the server (a gateway 502 / 504, a read timeout, ...); check the experiments page on the platform
-  before running again.
+  the server (a gateway 502 / 504, a read timeout, ...) and retries got no answer either. When the
+  error's `params` carry the `idempotency_key` that was sent, calling `Client().create_experiment(...)`
+  with that key and the same arguments returns the experiment; otherwise (an older platform) check the
+  experiments page on the platform before running again.
 - **With `capture_content`, content that instrumentations emit as log events is missing**: pass the
   `LoggerProvider` they use to `init(logger_provider=...)`; see
   [Content capture and privacy](#content-capture-and-privacy).
-- **Replay items all `timeout`, receipt `none`**: the platform runs on SQLite and the service uses
-  `flush_on_traceparent`; see [Replay receipts](#replay-receipts).
+- **Replay items all `timeout`, receipt `none`**: an older platform runs on SQLite and the service
+  uses `flush_on_traceparent`; see [Replay receipts](#replay-receipts).
 - **Receipt `version_source = none`**: the spans did not arrive within `receipt_wait_s`, or the service
   did not join the `traceparent` (no middleware, or the context was lost in a thread pool).
 - **Proxies**: OTLP export and REST calls both honor `HTTPS_PROXY` / `NO_PROXY`.
@@ -726,7 +751,11 @@ spans. The handle `init()` returns also works as a context manager.
 - Platform: the OTLP/HTTP endpoints (`/otlp/v1/traces`, `/otlp/v1/logs`) and key endpoints
   (`/api/v1`) of the current `main` of
   [InsightMon/insightmon-ai-eval](https://github.com/InsightMon/insightmon-ai-eval); the contract is in
-  [docs/contract.md](docs/contract.md). On a platform backed by SQLite mind the limit in
+  [docs/contract.md](docs/contract.md). The experiment idempotency key, `GET /api/v1/score-configs`,
+  `items:batch` listing every invalid score, experiment traces recognized by
+  `insightmon.experiment_id`, and replays that commit before calling the service shipped with
+  database migration 0009 of the platform; on an older platform the SDK falls back to its earlier
+  behavior (see the note at the top of contract.md), and on SQLite mind the limit in
   [Replay receipts](#replay-receipts).
 - Web frameworks: the ASGI / WSGI middlewares depend on no framework.
 

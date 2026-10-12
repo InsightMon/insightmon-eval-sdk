@@ -15,6 +15,9 @@
   proxy variables removed; `insightmon.shutdown()` runs before it closes. The generic
   `OTEL_EXPORTER_OTLP_*HEADERS` variables are left as they are: the SDK's exporters must
   ignore them.
+- The background read of score configs by `log_evaluation()` (`logs._fetch_score_names`)
+  answers None in unit tests (autouse; integration tests read the platform): no request goes
+  to the collector or the network. tests/test_logs.py replaces it to test the check.
 
 Add fixtures that only one area needs to that area's test modules instead.
 """
@@ -36,7 +39,7 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 import insightmon
-from insightmon import _config, _context, _export
+from insightmon import _config, _context, _export, logs
 
 from .collector import PROXY_VARS, Collector
 
@@ -63,6 +66,13 @@ def _isolate_sdk_state(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     _config.reset_runtime()
     _context.reset_context_state()
     _export.reset_rejections()
+
+
+@pytest.fixture(autouse=True)
+def _no_score_config_reads(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    if request.node.get_closest_marker("integration") is None:
+        monkeypatch.setattr(logs, "_fetch_score_names", lambda settings: None)
+    monkeypatch.setattr(logs, "_name_check", None)
 
 
 # --------------------------------------------------------------------------- tracing
