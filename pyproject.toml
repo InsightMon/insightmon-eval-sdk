@@ -1,0 +1,85 @@
+[project]
+name = "insightmon-eval-sdk"
+dynamic = ["version"]
+description = "InsightMon AI Eval SDK: report agent sessions over OTLP and run client-side experiments"
+readme = "README.md"
+requires-python = ">=3.10"
+keywords = ["opentelemetry", "evaluation", "agents", "observability"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Typing :: Typed",
+]
+# Kept deliberately small: OpenTelemetry (API, SDK, OTLP/HTTP exporter) and httpx.
+# 1.35 is the first OpenTelemetry release whose LogRecord carries `event_name`.
+dependencies = [
+  "opentelemetry-api>=1.35",
+  "opentelemetry-sdk>=1.35",
+  "opentelemetry-exporter-otlp-proto-http>=1.35",
+  "httpx>=0.27",
+]
+
+[project.urls]
+Homepage = "https://github.com/InsightMon/insightmon-eval-sdk"
+Platform = "https://github.com/InsightMon/insightmon-ai-eval"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3",
+  "pytest-asyncio>=0.24",
+  "ruff>=0.8",
+  "mypy>=1.13",
+  "uvicorn>=0.30",
+]
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/insightmon/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/insightmon"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "src/insightmon", "tests", "docs", "examples", "scripts",
+  "README.md", "README.en.md", "CHANGELOG.md", "pyproject.toml",
+]
+
+# ---------------------------------------------------------------- ruff (same rules as the platform)
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "ASYNC", "RUF", "C4", "PIE", "PT"]
+ignore = [
+  "RUF001", "RUF002", "RUF003",  # CJK text and full-width punctuation are legitimate here
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["insightmon"]
+
+# ---------------------------------------------------------------- mypy
+[tool.mypy]
+python_version = "3.10"
+strict = true
+files = ["src"]
+warn_unreachable = true
+
+# ---------------------------------------------------------------- pytest
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+  "integration: needs a running platform (INSIGHTMON_IT_* variables, scripts/integration.sh); skipped otherwise",
+]

@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+
+# tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# local databases and logs (e.g. of a hand-started platform or a debugging run)
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# local environment (never commit keys)
+.env
+.env.*
+
+# editors / OS
+.idea/
+.vscode/
+.DS_Store
