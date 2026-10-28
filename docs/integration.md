@@ -100,6 +100,7 @@ pip install "insightmon-eval-sdk @ git+https://github.com/InsightMon/insightmon-
 
 ```python
 """一个不依赖 LangGraph 的普通 Python 客服服务：手写埋点。"""
+
 import functools
 
 import insightmon
@@ -144,27 +145,29 @@ def handle_message(chat_id: str, user_id: str, text: str, *, last: bool = False)
     with insightmon.thread(chat_id, user_ref=user_id, metadata={"channel": "app"}):
         with insightmon.turn(end_thread=last):
             order = lookup_order("A123")
-            answer = call_llm([{"role": "user", "content": text}, {"role": "tool", "content": str(order)}])
+            answer = call_llm(
+                [{"role": "user", "content": text}, {"role": "tool", "content": str(order)}]
+            )
             # 对话内容：只在 init(capture_content=True) 时发送
             insightmon.record_io(input_messages=text, output_messages=answer)
             return answer
 
 
 if __name__ == "__main__":
-    insightmon.init(                      # 读取 INSIGHTMON_BASE_URL / INSIGHTMON_API_KEY
+    insightmon.init(  # 读取 INSIGHTMON_BASE_URL / INSIGHTMON_API_KEY
         agent_name="order-bot",
-        agent_version="2.3.1",            # ← agent 版本，见 §6
-        components=[                      # ← 组件版本，见 §6
+        agent_version="2.3.1",  # ← agent 版本，见 §6
+        components=[  # ← 组件版本，见 §6
             {"type": "prompt", "name": "system", "version": "p12"},
             {"type": "model", "name": "main", "version": "gpt-4o-2024-08-06"},
         ],
-        language="zh",                    # zh / en / ja / mixed / und
+        language="zh",  # zh / en / ja / mixed / und
         environment="production",
-        capture_content=True,             # 默认 False：不发送消息内容
+        capture_content=True,  # 默认 False：不发送消息内容
     )
     print(handle_message("chat-py-001", "u_9f2", "我的订单到哪了？"))
     print(handle_message("chat-py-001", "u_9f2", "好的谢谢", last=True))
-    insightmon.shutdown()                 # 短命脚本退出前导出剩余数据；常驻服务退出时自动调用
+    insightmon.shutdown()  # 短命脚本退出前导出剩余数据；常驻服务退出时自动调用
 ```
 
 运行后在平台侧栏「会话与 Trace」搜 `chat-py-001`：一个已关闭的会话（关闭原因 `explicit`）、两个 trace，每个
