@@ -663,3 +663,4 @@ make build              # uv build
 - [docs/conventions.md](docs/conventions.md)：属性与事件名一览（测试对照 `semconv.py` 检查）。
 - [docs/contract.md](docs/contract.md)：从平台代码整理的契约（端点、属性、日志事件、回放、evaluate 流程、差异与缺口）。
 - [docs/design.md](docs/design.md)：公共 API 与模块结构。
+- [docs/integration.md](docs/integration.md)：其他服务（Python 或任意语言、不依赖 LangGraph 等框架）的埋点接入指南：SDK、OpenTelemetry、直接 HTTP、会话导入。

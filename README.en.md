@@ -785,3 +785,4 @@ Docs:
 - [docs/contract.md](docs/contract.md): the contract as read from the platform code (endpoints,
   attributes, log events, replay, the evaluate flow, differences and gaps).
 - [docs/design.md](docs/design.md): the public API and the module layout.
+- [docs/integration.md](docs/integration.md): integration guide (in Chinese) for reporting from other services in any language, with or without an agent framework: the SDK, OpenTelemetry, plain HTTP, thread import.
