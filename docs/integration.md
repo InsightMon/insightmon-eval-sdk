@@ -99,7 +99,7 @@ pip install "insightmon-eval-sdk @ git+https://github.com/InsightMon/insightmon-
 `thread()` + `turn()`、模型和工具调用各开一个 span。
 
 ```python
-"""一个不依赖 LangGraph 的普通 Python 客服服务：手写埋点。"""
+"""一个不依赖 LangGraph 的普通 Python Agent 服务：手写埋点。"""
 
 import functools
 
